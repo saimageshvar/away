@@ -1,0 +1,39 @@
+name: ci
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Guard self-test
+        run: |
+          chmod +x bin/away hooks/guard.sh hooks/guard.py
+          out=$(AWAY_HOME="$PWD" bash bin/away selftest 2>&1)
+          printf '%s\n' "$out"
+          [ "$out" = "ok" ]
+      - name: Policy suite
+        run: AWAY_TEST=1 python3 tests/policy_cases.py
+      - name: Shell syntax
+        run: bash -n install.sh uninstall.sh bin/away hooks/guard.sh
+      - name: Python syntax
+        run: python3 -m py_compile bin/setup.py bin/update.py bin/report.py hooks/guard.py
+      - name: Permission audit rules
+        run: python3 tests/audit_cases.py
+      - name: Update path
+        run: python3 tests/update_cases.py
+      # A full install into a throwaway HOME: proves setup wires a clean machine
+      # and doctor agrees, which is the path a new colleague actually takes.
+      - name: End-to-end install
+        run: bash tests/install_e2e.sh
+      # The curl entry point, against a locally built tarball -- the one path
+      # that cannot be exercised from a checkout alone.
+      - name: Installer from a tarball
+        run: bash tests/installer_e2e.sh

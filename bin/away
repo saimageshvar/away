@@ -1,0 +1,630 @@
+#!/bin/bash
+# away — toggle away mode for every running Claude Code agent.
+#
+# The flag file's existence is the switch. Hooks re-read it on every tool call,
+# which is why a running agent picks up a change without a new prompt.
+set -u
+
+AWAY_HOME="${AWAY_HOME:-$HOME/.claude/away}"
+STATE="$AWAY_HOME/state"
+FLAG="$STATE/active.json"
+ENDED="$STATE/ended.json"
+REPORT="$AWAY_HOME/bin/report.py"
+SETUP="$AWAY_HOME/bin/setup.py"
+UPDATER="$AWAY_HOME/bin/update.py"
+
+PY=""
+for candidate in /opt/homebrew/bin/python3 /usr/bin/python3 python3; do
+  if command -v "$candidate" >/dev/null 2>&1; then PY="$candidate"; break; fi
+done
+if [ -z "$PY" ]; then
+  echo "away: no python3 found" >&2
+  exit 1
+fi
+
+mkdir -p "$STATE/trash"
+
+elapsed_human() {
+  local since=$1 now diff hours mins
+  now=$(date +%s)
+  diff=$(( now - since ))
+  [ "$diff" -lt 0 ] && diff=0
+  hours=$(( diff / 3600 ))
+  mins=$(( (diff % 3600) / 60 ))
+  if [ "$hours" -gt 0 ]; then printf '%dh%dm' "$hours" "$mins"; else printf '%dm' "$mins"; fi
+}
+
+since_epoch() {
+  [ -f "$FLAG" ] || { echo 0; return; }
+  "$PY" -c 'import json,sys
+try: print(int(json.load(open(sys.argv[1])).get("since_epoch") or 0))
+except Exception: print(0)' "$FLAG"
+}
+
+SESSIONS="$STATE/sessions"
+
+# --here scopes a command to the calling session. CLAUDE_CODE_SESSION_ID matches
+# the session_id the hooks receive, and is unset in a plain terminal.
+here=0
+args=()
+for a in "$@"; do
+  if [ "$a" = "--here" ]; then here=1; else args+=("$a"); fi
+done
+set -- ${args[@]+"${args[@]}"}
+
+my_session() {
+  local sid="${CLAUDE_CODE_SESSION_ID:-${CLAUDE_SESSION_ID:-}}"
+  case "$sid" in
+    ""|*[/\"]*) return 1 ;;
+    *) printf '%s' "$sid" ;;
+  esac
+}
+
+# The flag governing the CALLER, resolved exactly as guard.py's away_on() does:
+# global first, then this session's own. Checking only the global flag made
+# `away decision` a no-op for every absence armed with `away on --here`.
+effective_flag() {
+  local sid
+  if [ -f "$FLAG" ]; then printf '%s' "$FLAG"; return 0; fi
+  sid=$(my_session) || return 1
+  [ -f "$SESSIONS/$sid.json" ] && { printf '%s' "$SESSIONS/$sid.json"; return 0; }
+  return 1
+}
+
+flag_since() {
+  "$PY" -c 'import json,sys
+try: print(int(json.load(open(sys.argv[1])).get("since_epoch") or 0))
+except Exception: print(0)' "$1"
+}
+
+# Rotation happens only here, never in the guard: rotating mid-absence would
+# erase that absence from the digest, the stop nudge and the retry counter, and
+# two agents could race each other into a double rotation.
+rotate_log() {
+  local log="$STATE/events.jsonl" bytes
+  [ -f "$log" ] || return 0
+  bytes=$(wc -c < "$log" 2>/dev/null | tr -d ' ')
+  [ -n "$bytes" ] && [ "$bytes" -gt 5242880 ] || return 0
+  mv "$log" "$log.$(date +%Y%m%d-%H%M%S).bak"
+  echo "away: event log passed 5MB and was rotated."
+}
+
+# Arming a broken guard is the worst outcome: PreToolUse fails closed, so every
+# Bash call in every agent would be blocked. Prove it works first.
+run_selftest() {
+  "$PY" - "$AWAY_HOME" <<'SELFTEST' 2>&1
+import json, os, subprocess, sys, tempfile
+home = sys.argv[1]
+guard = os.path.join(home, "hooks", "guard.py")
+with tempfile.TemporaryDirectory() as sandbox:
+    os.makedirs(os.path.join(sandbox, "state"))
+    open(os.path.join(sandbox, "state", "active.json"), "w").write('{"on":true}')
+    env = dict(os.environ, AWAY_HOME=sandbox)
+    checks = [
+        ("AskUserQuestion is denied",
+         {"session_id": "selftest", "cwd": sandbox, "tool_name": "AskUserQuestion",
+          "tool_input": {"questions": [{"question": "q", "options": [{"label": "A"}]}]}},
+         "deny"),
+        ("an unscopable delete is denied",
+         {"session_id": "selftest", "cwd": sandbox, "tool_name": "Bash",
+          "tool_input": {"command": 'sh -c "rm -rf /Users/x"'}},
+         "deny"),
+        ("an ordinary command is untouched",
+         {"session_id": "selftest", "cwd": sandbox, "tool_name": "Bash",
+          "tool_input": {"command": "docker run --rm -it ubuntu bash"}},
+         None),
+        ("plan exit is approved",
+         {"session_id": "selftest", "cwd": sandbox, "tool_name": "ExitPlanMode",
+          "tool_input": {"plan": "p"}},
+         "allow"),
+    ]
+    for label, payload, want in checks:
+        proc = subprocess.run([sys.executable, guard, "pretooluse"],
+                              input=json.dumps(payload), capture_output=True,
+                              text=True, env=env, timeout=30)
+        if proc.returncode != 0:
+            print("FAIL %s: guard exited %d\n%s" % (label, proc.returncode,
+                                                    proc.stderr.strip()))
+            raise SystemExit(1)
+        if want is None:
+            # Empty output is `defer`, which is how the guard leaves ordinary
+            # work alone. A guard that denies everything also passes a
+            # deny-only selftest, so one such case has to be in here.
+            if proc.stdout.strip():
+                print("FAIL %s: expected no decision, got %s" % (label, proc.stdout))
+                raise SystemExit(1)
+            continue
+        try:
+            got = json.loads(proc.stdout)["hookSpecificOutput"]["permissionDecision"]
+        except Exception as exc:
+            print("FAIL %s: unreadable output %r (%s)" % (label, proc.stdout, exc))
+            raise SystemExit(1)
+        if got != want:
+            print("FAIL %s: expected %s, got %s" % (label, want, got))
+            raise SystemExit(1)
+print("ok")
+SELFTEST
+}
+
+# The last copy that passed the selftest. guard.sh falls back to it when the
+# live guard crashes, because a broken guard blocks EVERY tool call in EVERY
+# session and no agent may repair it while away mode is on.
+bless_guard() {
+  cp "$AWAY_HOME/hooks/guard.py" "$AWAY_HOME/hooks/guard.py.good" 2>/dev/null || true
+}
+
+# Every scope change is auditable: an agent may arm or disarm its own session, so
+# `away report` must be able to show that it did.
+log_scope_change() {
+  local sid="$1" event="$2" note="$3"
+  EVENTS="$STATE/events.jsonl" SID="$sid" EV="$event" NOTE="$note" CWD="$PWD" \
+    "$PY" -c '
+import json, os, subprocess, time
+cwd = os.environ["CWD"]
+try:
+    p = subprocess.run(("git", "rev-parse", "--abbrev-ref", "HEAD"), cwd=cwd,
+                       capture_output=True, timeout=5)
+    branch = p.stdout.decode().strip() if p.returncode == 0 else None
+except Exception:
+    branch = None
+sid = os.environ["SID"]
+rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+       "session": sid, "label": "%s/%s" % (os.path.basename(cwd), sid[:6]),
+       "cwd": cwd, "branch": branch, "agent": "main", "agent_type": None,
+       "pid": os.getpid(), "event": os.environ["EV"], "tool": None,
+       "detail": {"note": os.environ.get("NOTE") or None},
+       "rule": "away: session scope changed"}
+if os.environ.get("AWAY_TEST"):
+    rec["synthetic"] = True
+with open(os.environ["EVENTS"], "a", encoding="utf-8") as f:
+    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+' 2>/dev/null || true
+}
+
+session_count() {
+  [ -d "$SESSIONS" ] || { echo 0; return; }
+  set -- "$SESSIONS"/*.json
+  [ -e "$1" ] && echo $# || echo 0
+}
+
+cmd="${1:-status}"
+shift || true
+
+# Release check ahead of the command. update.py is silent unless it has something
+# to say, and it self-censors when stdin is not a terminal or an absence is on --
+# so an agent calling `away decision` never sees it.
+#
+# An allowlist, not a skiplist: `status` is polled by statuslines on every render
+# and `decision` is called by agents mid-task, so neither may pay for a python
+# start. `update` and `selftest` are out to keep the update path from re-entering.
+case "$cmd" in
+  on|off|report|doctor|setup|trash|purge|version|--version|-V|help|-h|--help)
+    [ -f "$UPDATER" ] && "$PY" "$UPDATER" notify || true ;;
+esac
+
+case "$cmd" in
+  on)
+    note="${*:-}"
+    if [ "$here" = "1" ]; then
+      sid=$(my_session) || {
+        echo "away: --here needs CLAUDE_CODE_SESSION_ID, which a plain terminal" >&2
+        echo "      does not set. Run it from inside a session, or use /away." >&2
+        exit 1
+      }
+      if [ -f "$FLAG" ]; then
+        # Arming globally deletes this layer, so writing a flag now would survive
+        # the global disarm and silently keep one session armed.
+        echo "away: a global absence is already active, so it covers this session."
+        echo "      Nothing written. Use \`away status\` to see the global state."
+        exit 0
+      fi
+    fi
+    selftest=$(run_selftest)
+    if [ "$selftest" != "ok" ]; then
+      echo "away: NOT armed — the guard failed its self-test." >&2
+      printf '%s\n' "$selftest" >&2
+      echo "away: fix $AWAY_HOME/hooks/guard.py first; away mode is still OFF." >&2
+      exit 1
+    fi
+    bless_guard
+    # Before the baseline is computed below, so events_baseline counts the log
+    # that will actually be read during this absence.
+    rotate_log
+    if [ "$here" = "1" ]; then
+      mkdir -p "$SESSIONS"
+      TARGET="$SESSIONS/$sid.json"
+      [ -f "$TARGET" ] && start=$("$PY" -c 'import json,sys
+try: print(int(json.load(open(sys.argv[1])).get("since_epoch") or 0))
+except Exception: print(0)' "$TARGET") || start=$(date +%s)
+      [ "${start:-0}" = "0" ] && start=$(date +%s)
+    else
+      TARGET="$FLAG"
+      if [ -f "$FLAG" ]; then start=$(since_epoch); else start=$(date +%s); fi
+    fi
+    FLAG="$TARGET" NOTE="$note" START="$start" EVENTS="$STATE/events.jsonl" "$PY" -c '
+import json, os, time
+start = int(os.environ["START"])
+# Baseline the log length so the statusline can count this absence cheaply,
+# without re-parsing timestamps on every render.
+try:
+    with open(os.environ["EVENTS"], "rb") as fh:
+        baseline = sum(1 for _ in fh)
+except OSError:
+    baseline = 0
+json.dump({
+    "on": True,
+    "since": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start)),
+    "since_epoch": start,
+    "events_baseline": baseline,
+    "note": os.environ.get("NOTE") or None,
+}, open(os.environ["FLAG"], "w"), indent=2)
+' 2>/dev/null || {
+      # Keep the switch working even if the metadata write path changes.
+      printf '{"on":true,"since_epoch":%s,"note":"%s"}\n' "$start" "$note" > "$TARGET"
+    }
+    if [ "$here" = "1" ]; then
+      log_scope_change "$sid" "session_away_on" "$note"
+      if [ -n "$note" ]; then echo "away: on for THIS session only  ($note)"
+      else echo "away: on for THIS session only"; fi
+      echo "other sessions are unaffected. A global \`away on\` would reset this."
+    else
+      # The global flag is authoritative, so it resets the session layer rather
+      # than running on top of stale per-session settings.
+      rm -rf "$SESSIONS" 2>/dev/null
+      rm -f "$ENDED"; rm -rf "$STATE/consumed" 2>/dev/null
+      rm -rf "$STATE/sessions-ended" 2>/dev/null
+      # A new absence re-greets every session with the full rules.
+      rm -rf "$STATE/greeted" 2>/dev/null
+      if [ -n "$note" ]; then echo "away: on  ($note)"; else echo "away: on"; fi
+      echo "every running agent picks this up on its next tool call."
+    fi
+    ;;
+
+  off)
+    if [ "$here" = "1" ]; then
+      # A trailing id/prefix (e.g. `away off --here e7f9f109`, matching the
+      # 8-char prefix `away status` prints) lets the operator disarm a busy
+      # session from a fresh terminal, without waiting on that session's
+      # queued chat turn to reach the guard's flag check.
+      if [ -n "${1:-}" ]; then
+        want="$1"
+        sid=""
+        if [ -f "$SESSIONS/$want.json" ]; then
+          sid="$want"
+        else
+          for f in "$SESSIONS/$want"*.json; do
+            [ -e "$f" ] || continue
+            if [ -n "$sid" ]; then
+              echo "away: '$want' matches more than one session; use more characters." >&2
+              exit 1
+            fi
+            sid=$(basename "$f" .json)
+          done
+        fi
+        [ -n "$sid" ] || {
+          echo "away: no session flag matches '$want'. See \`away status\` for live ids." >&2
+          exit 1
+        }
+      else
+        sid=$(my_session) || {
+          echo "away: --here needs CLAUDE_CODE_SESSION_ID, or pass a session id/prefix" >&2
+          echo "      (away off --here <id>). Run it inside a session, or use /away." >&2
+          exit 1
+        }
+      fi
+      TARGET="$SESSIONS/$sid.json"
+      if [ ! -f "$TARGET" ]; then
+        if [ -f "$FLAG" ]; then
+          echo "away: this session has no flag of its own. A global absence is"
+          echo "      active, and only the operator can end that from a terminal."
+        else
+          echo "away: off  (this session had no flag of its own)"
+        fi
+        exit 0
+      fi
+      start=$(flag_since "$TARGET")
+      dur=$(elapsed_human "$start")
+      rm -f "$TARGET"
+      log_scope_change "$sid" "session_away_off" ""
+      # A session-scoped absence ends alone, so it writes its own end marker.
+      # Without one this session never received the hand-back digest that a
+      # global `away off` gives every session.
+      mkdir -p "$STATE/sessions-ended"
+      ENDED_FILE="$STATE/sessions-ended/$sid.json" DUR="$dur" START="$start" "$PY" -c '
+import json, os, time
+json.dump({"duration": os.environ["DUR"],
+           "since": int(os.environ["START"]),
+           "until": int(time.time())},
+          open(os.environ["ENDED_FILE"], "w"), indent=2)
+' 2>/dev/null || true
+      rm -f "$STATE/consumed/$sid" 2>/dev/null
+      rotate_log
+      echo "away: off for THIS session  (was on $dur)"
+      echo
+      "$PY" "$REPORT" digest "$start" --session "$sid"
+      exit 0
+    fi
+    if [ ! -f "$FLAG" ]; then
+      echo "away: off  (was already off)"
+      exit 0
+    fi
+    start=$(since_epoch)
+    dur=$(elapsed_human "$start")
+    digest=$("$PY" "$REPORT" digest "$start" 2>/dev/null || echo "(digest unavailable)")
+    count=$("$PY" "$REPORT" count "$start" 2>/dev/null || echo 0)
+    # Record only the window. Each session then reports ITS OWN events, so no
+    # agent is ever handed another agent's work to report.
+    prevnote=$("$PY" -c 'import json,sys
+try: print(json.load(open(sys.argv[1])).get("note") or "")
+except Exception: print("")' "$FLAG")
+    ENDED="$ENDED" DUR="$dur" START="$start" NOTE="$prevnote" "$PY" -c '
+import json, os, time
+json.dump({"duration": os.environ["DUR"],
+           "since": int(os.environ["START"]),
+           "until": int(time.time()),
+           "note": os.environ.get("NOTE") or None},
+          open(os.environ["ENDED"], "w"), indent=2)
+' 2>/dev/null || true
+    rm -rf "$STATE/consumed" 2>/dev/null
+    rm -f "$FLAG"
+    echo "away: off  (was on $dur)"
+    echo
+    printf '%s\n' "$digest"
+    ;;
+
+  status|"")
+    scoped=$(session_count)
+    if [ -f "$FLAG" ]; then
+      start=$(since_epoch)
+      count=$("$PY" "$REPORT" count "$start" 2>/dev/null || echo 0)
+      note=$("$PY" -c 'import json,sys
+try: print(json.load(open(sys.argv[1])).get("note") or "")
+except Exception: print("")' "$FLAG")
+      line="away: on globally  $(elapsed_human "$start")  ${count} logged"
+      [ -n "$note" ] && line="$line  ($note)"
+      echo "$line"
+    elif [ "$scoped" -gt 0 ]; then
+      echo "away: off globally, on for ${scoped} session(s)"
+    else
+      echo "away: off"
+    fi
+    if [ -f "$FLAG" ] && [ "$scoped" -gt 0 ]; then
+      echo "  warning: ${scoped} session flag(s) survived a global arm; expected none."
+    elif [ "$scoped" -gt 0 ]; then
+      for f in "$SESSIONS"/*.json; do
+        [ -e "$f" ] || continue
+        s=$(basename "$f" .json)
+        st=$("$PY" -c 'import json,sys
+try:
+    d=json.load(open(sys.argv[1])); print(int(d.get("since_epoch") or 0), d.get("note") or "")
+except Exception: print(0, "")' "$f")
+        printf '  %s  %s  %s\n' "${s:0:8}" "$(elapsed_human "${st%% *}")" "${st#* }"
+      done
+    fi
+    ;;
+
+  report)
+    start=0
+    only_session=""
+    if [ "${1:-}" = "--since" ] && [ -n "${2:-}" ]; then
+      start=$("$PY" -c '
+import re, sys, time
+spec = sys.argv[1]
+m = re.fullmatch(r"(\d+)([hmd])", spec)
+if not m:
+    print(0); raise SystemExit(0)
+mult = {"m": 60, "h": 3600, "d": 86400}[m.group(2)]
+print(int(time.time()) - int(m.group(1)) * mult)' "$2")
+    elif mine=$(effective_flag); then
+      # A session-scoped absence has its own window, and reporting from epoch 0
+      # dumped every event this machine had ever logged.
+      start=$(flag_since "$mine")
+      case "$mine" in "$SESSIONS"/*) only_session=$(my_session) ;; esac
+    fi
+    rargs=(digest "$start")
+    [ -n "$only_session" ] && rargs+=(--session "$only_session")
+    for a in "$@"; do
+      if [ "$a" = "--all" ]; then rargs+=(--all); break; fi
+    done
+    "$PY" "$REPORT" "${rargs[@]}"
+    ;;
+
+  decision)
+    # An agent that follows the rules never triggers a denial, so its decisions
+    # leave no trace. This is how it records one.
+    text="${*:-}"
+    if [ -z "$text" ]; then
+      echo "usage: away decision \"what you decided and why\"" >&2
+      exit 2
+    fi
+    # Session-scoped absences count: `away on --here` is what the /away skill
+    # arms, and gating on the global flag alone silently dropped every decision
+    # taken during one.
+    if ! effective_flag >/dev/null; then
+      echo "away: off, so nothing was recorded (decisions are only logged while away)."
+      exit 0
+    fi
+    EVENTS="$STATE/events.jsonl" TEXT="$text" SID="${CLAUDE_CODE_SESSION_ID:-${CLAUDE_SESSION_ID:-unknown}}" \
+      CWD="$PWD" "$PY" -c '
+import json, os, subprocess, time
+cwd = os.environ["CWD"]
+def git(*a):
+    try:
+        p = subprocess.run(("git",) + a, cwd=cwd, capture_output=True, timeout=5)
+        return p.stdout.decode().strip() if p.returncode == 0 else None
+    except Exception:
+        return None
+sid = os.environ["SID"]
+rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+       "session": sid, "label": "%s/%s" % (os.path.basename(cwd), sid[:6]),
+       "cwd": cwd, "branch": git("rev-parse", "--abbrev-ref", "HEAD"),
+       "agent": "main", "agent_type": None, "pid": os.getpid(),
+       "event": "self_reported_decision", "tool": None,
+       "detail": {"decision": os.environ["TEXT"]},
+       "rule": "away: agent decided without asking"}
+# Same tag every other writer applies: an untagged test decision reads as a real
+# one in every other session.
+if os.environ.get("AWAY_TEST"):
+    rec["synthetic"] = True
+with open(os.environ["EVENTS"], "a", encoding="utf-8") as f:
+    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+' 2>/dev/null && echo "away: decision recorded." || echo "away: could not record the decision." >&2
+    ;;
+
+  setup)
+    # End-to-end wiring: PATH, skill, hooks, permission audit, fallback guard.
+    # Arming a broken guard blocks every tool call in every session, so the
+    # selftest gates the whole thing rather than running after it.
+    out=$(run_selftest)
+    if [ "$out" != "ok" ]; then
+      echo "away: NOT wired — the guard failed its self-test." >&2
+      printf '%s\n' "$out" >&2
+      echo "away: fix $AWAY_HOME/hooks/guard.py, then re-run \`away setup\`." >&2
+      exit 1
+    fi
+    bless_guard
+    "$PY" "$SETUP" setup "$@"
+    ;;
+
+  doctor)
+    # Run this after editing the guard, or any time a session behaves oddly.
+    # Away mode does not have to be on: a broken guard blocks every session the
+    # moment anything arms.
+    out=$(run_selftest)
+    if [ "$out" = "ok" ]; then
+      bless_guard
+      echo "  ok   guard passed its self-test, and this copy is now the fallback"
+    else
+      echo "  FAIL guard is BROKEN" >&2
+      printf '%s\n' "$out" | sed 's/^/       /' >&2
+      if [ -f "$AWAY_HOME/hooks/guard.py.good" ]; then
+        echo "       sessions are running on the fallback copy meanwhile" >&2
+      else
+        echo "       there is NO fallback copy, so every armed session is blocked" >&2
+      fi
+    fi
+    # The wiring audit runs either way: a healthy guard that no hook calls is
+    # exactly as inert as a broken one, and looks fine from here.
+    "$PY" "$SETUP" check
+    rc=$?
+    [ "$out" = "ok" ] || rc=1
+    if [ "$rc" -ne 0 ]; then
+      echo
+      echo "away: not healthy. Fix the FAIL lines above, or run \`away setup\`." >&2
+    fi
+    exit "$rc"
+    ;;
+
+  selftest)
+    # Guard-only check, used by the updater to verify a downloaded payload
+    # before it is allowed to serve a session.
+    out=$(run_selftest)
+    printf '%s\n' "$out"
+    [ "$out" = "ok" ] || exit 1
+    ;;
+
+  update)
+    sub="${1:-apply}"
+    case "$sub" in
+      --check|check) "$PY" "$UPDATER" check --force ;;
+      *)             "$PY" "$UPDATER" apply "$@" ;;
+    esac
+    ;;
+
+  version|--version|-V)
+    if [ -f "$AWAY_HOME/VERSION" ]; then
+      printf 'away %s\n' "$(cat "$AWAY_HOME/VERSION")"
+    else
+      echo "away (version unknown — no VERSION file at $AWAY_HOME)"
+    fi
+    echo "home: $AWAY_HOME"
+    ;;
+
+  uninstall)
+    if [ -f "$FLAG" ] || [ "$(session_count)" -gt 0 ]; then
+      echo "away: turn away mode off first (\`away off\`), so no session is left" >&2
+      echo "      armed against hooks that no longer exist." >&2
+      exit 1
+    fi
+    echo "Unwiring away mode from Claude Code:"
+    "$PY" "$SETUP" unwire
+    echo
+    echo "The payload at $AWAY_HOME is untouched. Remove it with:"
+    echo "  rm -rf '$AWAY_HOME'"
+    echo "Your event log and trash snapshots live in $STATE."
+    ;;
+
+  purge)
+    # Archive rather than delete: a polluted log is still evidence.
+    if [ -s "$STATE/events.jsonl" ]; then
+      stamp=$(date +%Y%m%d-%H%M%S)
+      mv "$STATE/events.jsonl" "$STATE/events.jsonl.$stamp.bak"
+      echo "away: log archived to events.jsonl.$stamp.bak; a fresh log starts now."
+    else
+      echo "away: log is already empty."
+    fi
+    ;;
+
+  trash)
+    sub="${1:-list}"
+    case "$sub" in
+      list|"") "$PY" "$REPORT" trash-list ;;
+      restore) shift; "$PY" "$REPORT" trash-restore "${1:-}" ;;
+      *) echo "away trash [list|restore <id>]" >&2; exit 2 ;;
+    esac
+    ;;
+
+  help|-h|--help)
+    cat <<'USAGE'
+away — away mode for every running Claude Code agent
+
+  away on [note]           turn away mode ON globally, with an optional note
+  away off                 turn it OFF globally and print the digest
+  away on --here [note]    turn it ON for the calling session only
+  away off --here          drop the calling session's own flag
+  away off --here <id>     drop another session's flag by id/prefix, from any terminal
+  away                     status: global state, plus any per-session flags
+  away report              digest for the current or last absence
+  away report --since 2h   digest for a time window (m/h/d)
+  away report --all        include synthetic test events, tagged TEST
+  away trash               list snapshots taken while away
+  away trash restore <id>  restore one snapshot
+  away decision "..."      record a call made without asking (for agents)
+  away purge               archive the event log and start a fresh one
+
+Install and health
+
+  away setup               wire the hooks, skill and PATH; audit permissions
+  away doctor              self-test the guard AND audit the whole install
+  away update              update to the latest release
+  away update --check      what the latest release is, without installing it
+  away version             installed version and home directory
+  away uninstall           unwire the hooks and skill (keeps your state)
+
+The note is not a label. It rides on every denial an agent reads, so write it as
+an instruction: away on "if blocked on push, commit and move on".
+
+Two layers. The global flag covers every session and is yours alone. A session
+flag covers one session, and an agent may set or drop its own with --here, which
+is what the /away skill does. Arming globally DELETES every session flag, so the
+two layers never disagree; `away off` then leaves nothing armed.
+
+Hooks enforce away mode. They read the flags on every tool call, so a running
+agent picks up a change without needing a new prompt. Agents are denied global
+`away on` and `away off`, and the resolver checks the global flag first, so a
+session can never free itself from a real absence.
+
+Every command first checks for a newer release, at most once a day. That check is
+skipped when away mode is on, and when the terminal is not interactive -- so it
+never interrupts an absence or an agent. Set AWAY_NO_UPDATE_CHECK=1 to disable it.
+
+Testing: see TESTING.md in the away home. Always set AWAY_TEST=1 for synthetic
+runs, or your test events read as a real incident in every other session.
+USAGE
+    ;;
+
+  *)
+    echo "away: unknown command '$cmd' (try: away help)" >&2
+    exit 2
+    ;;
+esac

@@ -1,0 +1,8 @@
+# Per-machine state: the event log, digests and trash snapshots.
+state/
+# The crash fallback is blessed locally by the self-test, never committed.
+hooks/guard.py.good
+dist/
+*.away-backup
+*.away-tmp
+.DS_Store

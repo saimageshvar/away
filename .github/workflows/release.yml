@@ -1,0 +1,54 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tag must match VERSION
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          file="$(tr -d '[:space:]' < VERSION)"
+          if [ "$tag" != "$file" ]; then
+            echo "tag $GITHUB_REF_NAME does not match VERSION ($file)" >&2
+            exit 1
+          fi
+
+      # The installer refuses a payload whose guard cannot pass its own self-test,
+      # so a release that would be refused must never be published.
+      - name: Guard self-test
+        run: |
+          chmod +x bin/away hooks/guard.sh hooks/guard.py
+          out=$(AWAY_HOME="$PWD" bash bin/away selftest 2>&1)
+          printf '%s\n' "$out"
+          [ "$out" = "ok" ]
+
+      - name: Policy suite
+        run: AWAY_TEST=1 python3 tests/policy_cases.py
+
+      - name: Build the tarball
+        run: |
+          name="away-${GITHUB_REF_NAME}"
+          mkdir -p "dist/$name"
+          # state/ is per-machine history and guard.py.good is blessed locally by
+          # the self-test; neither belongs in a release.
+          rsync -a --exclude '.git' --exclude '.github' --exclude 'state' \
+                --exclude 'guard.py.good' --exclude 'dist' ./ "dist/$name/"
+          tar -czf "dist/$name.tar.gz" -C dist "$name"
+          (cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256")
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+          body_path: CHANGELOG.md
+          generate_release_notes: true
