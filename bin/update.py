@@ -138,17 +138,25 @@ def download(tag, asset_url, dest):
         urls = [u for u in (asset_url,
                             "https://github.com/%s/archive/refs/tags/%s.tar.gz"
                             % (REPO, tag)) if u]
-    last = None
+    problems = []
     for url in urls:
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "away-cli"})
             with urllib.request.urlopen(req, timeout=60) as resp, \
                     open(dest, "wb") as fh:
                 shutil.copyfileobj(resp, fh)
+            # Falling back is fine; doing it silently is not. This call replaces
+            # the guard, so a change of provenance must be visible -- a release
+            # asset 404 can mean the upload is still in flight, or that somebody
+            # replaced the release.
+            for failed, exc in problems:
+                print("      note: %s failed (%s), fell back" % (failed, exc),
+                      file=sys.stderr)
             return url
         except (urllib.error.URLError, OSError) as exc:
-            last = exc
-    raise RuntimeError("could not download %s: %s" % (tag, last))
+            problems.append((url, exc))
+    detail = "\n".join("  %s -> %s" % (u, e) for u, e in problems)
+    raise RuntimeError("could not download %s:\n%s" % (tag, detail))
 
 
 def extract_payload(archive, into):
@@ -188,9 +196,16 @@ def verify(tree):
                            % (proc.stdout, proc.stderr))
 
 
+# Never installed: per-machine history, and repo furniture that a source-archive
+# fallback drags along. install.sh excludes the same names -- the two paths had
+# diverged, so an update left a release workflow sitting in the install.
+KEEP_STATE = {"state"}
+NOT_INSTALLED = {".git", ".github", ".gitignore"}
+
+
 def swap(tree):
     """Replace code, keep state. The event log and trash are the user's history."""
-    keep = {"state"}
+    keep = KEEP_STATE
     backup = AWAY.parent / (AWAY.name + ".away-previous")
     if backup.exists():
         shutil.rmtree(backup, ignore_errors=True)
@@ -200,7 +215,7 @@ def swap(tree):
             continue
         shutil.move(str(item), str(backup / item.name))
     for item in tree.iterdir():
-        if item.name in keep:
+        if item.name in keep or item.name in NOT_INSTALLED:
             continue
         shutil.move(str(item), str(AWAY / item.name))
     # guard.py.good is blessed per machine by the selftest, never shipped.

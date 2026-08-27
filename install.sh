@@ -135,9 +135,11 @@ if [ -d "$AWAY_HOME" ]; then
 fi
 
 mkdir -p "$AWAY_HOME"
+# Keep this exclusion list in step with NOT_INSTALLED in bin/update.py: the two
+# paths diverged once and an update left a release workflow in the install.
 for item in "$src"/* "$src"/.[!.]*; do
   [ -e "$item" ] || continue
-  case "$(basename "$item")" in state|.git|.github) continue ;; esac
+  case "$(basename "$item")" in state|.git|.github|.gitignore) continue ;; esac
   cp -R "$item" "$AWAY_HOME/"
 done
 mkdir -p "$AWAY_HOME/state/trash"

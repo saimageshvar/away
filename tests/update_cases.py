@@ -159,6 +159,46 @@ def test_good_update(tmp):
            (home.parent / (home.name + ".away-previous") / "VERSION").exists())
 
 
+def test_repo_furniture_not_installed(tmp):
+    """A source-archive fallback drags .github and .gitignore along; an install
+    is not a checkout, and the two code paths had diverged on this."""
+    home = fresh_home(tmp / "furniture")
+    staging = tmp / "furniture" / "stage-src" / "away-v2.0.0"
+    shutil.copytree(REPO, staging, ignore=shutil.ignore_patterns("state", ".git"))
+    (staging / "VERSION").write_text("2.0.0\n")
+    (staging / ".github" / "workflows").mkdir(parents=True, exist_ok=True)
+    (staging / ".github" / "workflows" / "release.yml").write_text("name: release\n")
+    (staging / ".gitignore").write_text("state/\n")
+    archive = tmp / "furniture" / "src.tar.gz"
+    with tarfile.open(archive, "w:gz") as tf:
+        tf.add(staging, arcname=staging.name)
+
+    proc = run_update(home, archive)
+    check("the update exits 0", proc.returncode, 0)
+    truthy("the payload landed", (home / "bin" / "away").exists())
+    truthy(".github was not installed", not (home / ".github").exists(),
+           "found %s" % (home / ".github"))
+    truthy(".gitignore was not installed", not (home / ".gitignore").exists())
+    # tests/ IS shipped on purpose -- the README tells people to run them.
+    truthy("tests were installed", (home / "tests" / "run_all.sh").exists())
+
+
+def test_download_failure_is_loud(tmp):
+    """Falling back is fine; doing it silently is not, when the thing being
+    swapped is the guard."""
+    import update
+    dest = tmp / "nope.tar.gz"
+    try:
+        update.download("v9.9.9", "file:///definitely/not/here.tar.gz", dest)
+        check("a total download failure raises", "returned", "raised")
+    except RuntimeError as exc:
+        check("a total download failure raises", True, True)
+        # The message must name every URL tried, or a provenance change is
+        # invisible in a log the operator reads after the fact.
+        check("the error names the url tried",
+              "not/here.tar.gz" in str(exc), True)
+
+
 def test_broken_payload_refused(tmp):
     """The whole point: a guard that fails its selftest never reaches disk."""
     home = fresh_home(tmp / "broken")
@@ -237,7 +277,8 @@ def main():
     print()
     with tempfile.TemporaryDirectory(prefix="away-update-test-") as raw:
         tmp = Path(raw)
-        for sub in ("good", "broken", "incomplete", "armed", "session", "notify"):
+        for sub in ("good", "furniture", "broken", "incomplete", "armed",
+                    "session", "notify"):
             (tmp / sub).mkdir()
         print("version comparison:")
         test_version_compare()
@@ -247,6 +288,10 @@ def main():
         test_unsafe_archive(tmp)
         print("\na good update:")
         test_good_update(tmp)
+        print("\nwhat an install is not:")
+        test_repo_furniture_not_installed(tmp)
+        print("\ndownload failures:")
+        test_download_failure_is_loud(tmp)
         print("\nrefusals:")
         test_broken_payload_refused(tmp)
         test_incomplete_payload_refused(tmp)

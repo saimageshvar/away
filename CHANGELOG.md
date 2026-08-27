@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.0.2
+
+Both fixes came from watching the real `away update 1.0.0 -> 1.0.1` run, not from a test.
+
+- The release-asset download 404'd while the workflow was still uploading it, and the
+  updater silently fell back to GitHub's source archive. Falling back is correct; doing
+  it silently is not, when the thing being swapped is the guard every tool call depends
+  on. Every failed URL is now reported, and a total failure names all of them.
+- That fallback also revealed that `swap()` installed whatever the archive contained,
+  so `.github/` and `.gitignore` landed in `~/.claude/away` -- a release workflow living
+  inside an install. `install.sh` had always excluded them; the two paths had diverged.
+  Both now share one exclusion list, `NOT_INSTALLED`. `tests/` is still shipped on
+  purpose, since the README tells people to run it.
+
 ## 1.0.1
 
 Corrects what the permission audit *says*. The behaviour it applies was already right;
