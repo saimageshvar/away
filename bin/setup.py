@@ -287,14 +287,17 @@ def audit_permissions(settings, f, source="settings.json"):
     ask = [r for r in (perms.get("ask") or []) if isinstance(r, str)]
     deny = [r for r in (perms.get("deny") or []) if isinstance(r, str)]
 
-    # The guard owns deletes in BOTH directions: it snapshots to away trash
-    # before allowing one, and it is the only `ask` on the path. A permission
-    # `ask` rule on the same commands fires a prompt the guard cannot answer.
+    # Hook decisions do NOT bypass permission rules: Claude Code evaluates deny
+    # and ask regardless of what a PreToolUse hook returned. So an `ask` rule on
+    # a delete prompts even though the guard already answered `allow` -- and
+    # while away, nothing answers that prompt.
     delete_asks = [r for r in ask if touches_deletion(r)]
     if delete_asks:
         f.fail("%d `ask` rule(s) collide with the guard on deletes" % len(delete_asks),
-               "%s\nThe guard already gates deletes and snapshots them to away\n"
-               "trash. A second `ask` here prompts with nobody there to answer."
+               "%s\nThe guard already gates deletes: it snapshots to away trash,\n"
+               "then answers `allow`. An `ask` rule still prompts on top of that\n"
+               "decision, and while away nobody is there to answer it, so the\n"
+               "agent stalls on its first delete."
                % "\n".join("  " + r for r in delete_asks),
                "remove these from permissions.ask (setup can do this)")
     else:
@@ -314,16 +317,37 @@ def audit_permissions(settings, f, source="settings.json"):
                "but an away agent can do almost nothing."
                % "\n".join("  " + r for r in broad_deny))
 
-    if deny:
-        f.ok("%d `deny` rule(s) left alone" % len(deny),
-             "deny is stricter than the guard, so it never conflicts.")
+    # A deny rule is always safe -- deny wins over the guard's `allow`, so the
+    # delete is simply blocked. The catch is reporting, not safety: the guard
+    # runs FIRST, so it has already snapshotted and logged `rm_allowed` by the
+    # time deny blocks the call. The digest then claims a delete that never
+    # happened, which is a lie in the one artifact the operator reads on return.
+    delete_denies = [r for r in deny if touches_deletion(r)]
+    if delete_denies:
+        f.warn("%d `deny` rule(s) cover deletes" % len(delete_denies),
+               "%s\nThese WIN over the guard, so nothing can be deleted -- that is\n"
+               "stricter than away mode, never looser, and setup leaves them be.\n"
+               "But the guard runs before the rule is evaluated, so it snapshots\n"
+               "and logs the delete as allowed before deny blocks it. Expect\n"
+               "`away report` to name deletes that never happened, and stale\n"
+               "snapshots in `away trash`."
+               % "\n".join("  " + r for r in delete_denies))
 
-    # Allow rules are not a hazard: PreToolUse fires on every tool call, and a
-    # hook denial outranks an allow. Say so, because it looks alarming.
+    other_denies = [r for r in deny if r not in delete_denies]
+    if other_denies:
+        f.ok("%d `deny` rule(s) left alone" % len(other_denies),
+             "deny outranks the guard, so it is stricter and never conflicts.")
+
+    # Allow rules are not a hazard: an allow only skips the PROMPT, and the guard
+    # has already returned its decision by then. Deliberately not claiming more
+    # than that -- the docs guarantee precedence over allow rules for a hook that
+    # exits 2, and the guard denies with a JSON decision instead so it can hand
+    # the agent a reason to act on.
     allow = perms.get("allow") or []
     if allow:
         f.ok("%d `allow` rule(s) left alone" % len(allow),
-             "the guard runs before the tool either way, and its deny wins.")
+             "an allow rule skips the prompt; it does not skip the guard, which\n"
+             "runs first on every tool call.")
 
     if source == "settings.json" and SETTINGS_LOCAL.exists():
         local, err = read_json(SETTINGS_LOCAL)

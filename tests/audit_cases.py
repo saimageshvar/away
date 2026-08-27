@@ -82,6 +82,37 @@ def test_mode_audit():
           (False, True))
 
 
+def test_deny_verdicts():
+    """deny outranks the guard, so it is never a failure -- but a deny on deletes
+    makes the away log claim deletes that never happened, and that must be said."""
+    print("\ndeny rules:")
+    f = audit.Findings()
+    audit.audit_permissions({"permissions": {
+        "defaultMode": "auto", "deny": ["Bash(curl:*)", "Bash(sudo:*)"]}}, f)
+    check("an ordinary deny list is clean", (f.failed, f.warned), (False, False))
+
+    f = audit.Findings()
+    audit.audit_permissions({"permissions": {
+        "defaultMode": "auto", "deny": ["Bash(rm:*)"]}}, f)
+    check("a deny on deletes never fails", f.failed, False)
+    check("a deny on deletes warns", f.warned, True)
+    text = " ".join(r[1] + " " + (r[2] or "") for r in f.rows)
+    check("the warning explains the stale log", "never happened" in text, True)
+    check("the warning says it is left alone", "leaves them be" in text, True)
+
+    # A mixed list must report both halves, not collapse into one verdict.
+    f = audit.Findings()
+    audit.audit_permissions({"permissions": {
+        "defaultMode": "auto", "deny": ["Bash(rm:*)", "Bash(curl:*)"]}}, f)
+    rows = [r for r in f.rows if "deny" in r[1]]
+    check("a mixed deny list reports two rows", len(rows), 2)
+
+    # Nothing in apply_permissions may touch deny, ever.
+    settings = {"permissions": {"defaultMode": "auto", "deny": ["Bash(rm:*)"]}}
+    audit.apply_permissions(settings)
+    check("apply never edits deny", settings["permissions"]["deny"], ["Bash(rm:*)"])
+
+
 def test_apply_is_surgical():
     """Only the conflicting rules go; everything else is left exactly as-is."""
     print("\napply_permissions:")
@@ -125,6 +156,7 @@ def main():
     test_deletion_matching()
     test_broad_bash()
     test_mode_audit()
+    test_deny_verdicts()
     test_apply_is_surgical()
     test_hook_identity()
     print()

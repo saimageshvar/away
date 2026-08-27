@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.0.1
+
+Corrects what the permission audit *says*. The behaviour it applies was already right;
+two of its explanations were not, and one real consequence went unmentioned.
+
+The governing fact, now quoted in the README:
+
+> Hook decisions don't bypass permission rules. Claude Code evaluates deny and ask
+> rules regardless of what a PreToolUse hook returns.
+
+- The `ask`-on-deletes failure is now stated for the right reason. It is not that a
+  second prompt appears; it is that the rule prompts **on top of the guard's `allow`**,
+  and while away nothing answers it.
+- `deny` rules covering deletes now raise a warning instead of being folded into
+  "deny never conflicts". They are still never modified, and they are still safe --
+  deny wins, so nothing is deleted. But `PreToolUse` runs before the rule is
+  evaluated, so the guard has already snapshotted and logged the delete as allowed.
+  `away report` would name deletes that never happened and `away trash` would hold
+  snapshots of files still on disk, which defeats the purpose of the log.
+- The `allow`-rule note no longer claims the guard's denial outranks an allow rule.
+  The documented precedence over allow rules is for a hook that exits 2; the guard
+  denies with a JSON decision instead, so it can hand the agent a reason to act on.
+  The note now says only what is true: an allow rule skips the prompt, not the guard.
+
 ## 1.0.0
 
 First packaged release. The guard and CLI were already in use; this turns them into

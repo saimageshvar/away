@@ -66,16 +66,40 @@ something looks wrong.
 `away doctor` and `away setup` both check for these. They are not style
 preferences — each one leaves an unattended agent stuck.
 
+**Permission rules outrank the guard.** This is the fact the whole table below turns
+on, and it is documented:
+
+> Hook decisions don't bypass permission rules. Claude Code evaluates deny and ask
+> rules regardless of what a PreToolUse hook returns: a matching deny rule blocks the
+> call, and a matching ask rule still prompts even when the hook returned `"allow"` or
+> `"ask"`.
+>
+> — [Configure permissions](https://code.claude.com/docs/en/permissions#extend-permissions-with-hooks)
+
+So the guard cannot loosen anything you have locked down, and an `ask` rule the guard
+was meant to replace does not go away just because the guard answered.
+
 | Setting | Why it breaks | Fix |
 |---|---|---|
 | `permissions.defaultMode` is `default`, `plan`, or `acceptEdits` | Claude Code raises approval prompts for anything not pre-allowed. Nobody answers them, so the agent stalls instead of routing around. | `"auto"` |
-| An `ask` rule matching `rm` / `unlink` / `shred` / `-delete` | The guard already gates deletes — it snapshots to `away trash`, then allows. A second `ask` on the same command prompts with nobody there. | remove the rule |
+| An `ask` rule matching `rm` / `unlink` / `shred` / `-delete` | The guard already gates deletes — snapshot to `away trash`, then `allow`. The `ask` rule **still prompts on top of that decision**, and while away nothing answers it, so the agent stalls on its first delete. | remove the rule |
 | `ask` matching every Bash call (`Bash`, `Bash(*)`, `Bash(*:*)`) | Every shell command waits for an answer that never comes. | narrow or remove |
 
-Your `allow` and `deny` lists are left alone, and `away doctor` says so explicitly.
-`deny` is stricter than away mode, never looser. `allow` is not a hazard either:
-the `PreToolUse` hook runs before the tool regardless, and a hook denial outranks
-an allow rule.
+### `deny` rules are safe, and setup never touches them
+
+A `deny` rule wins over the guard, so anything you deny stays denied — stricter than
+away mode, never looser. Keep them.
+
+One caveat if you deny deletes specifically (`deny: ["Bash(rm:*)"]` or similar):
+`PreToolUse` runs *before* the permission rule is evaluated, so the guard has already
+snapshotted the targets and logged the delete as allowed by the time `deny` blocks it.
+Nothing is lost — the delete genuinely does not happen — but **`away report` will name
+deletes that never occurred, and `away trash` will hold snapshots of files still on
+disk.** `away doctor` warns when it sees this, because a misleading digest defeats the
+point of the log.
+
+`allow` rules are also left alone. An allow rule skips the *prompt*; it does not skip
+the guard, which runs first on every tool call.
 
 `settings.local.json` is checked too — project-local settings win, so a conflict
 there is not fixed by editing `settings.json`.
