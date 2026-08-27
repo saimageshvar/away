@@ -22,17 +22,14 @@ jobs:
             exit 1
           fi
 
-      # The installer refuses a payload whose guard cannot pass its own self-test,
-      # so a release that would be refused must never be published.
-      - name: Guard self-test
-        run: |
-          chmod +x bin/away hooks/guard.sh hooks/guard.py
-          out=$(AWAY_HOME="$PWD" bash bin/away selftest 2>&1)
-          printf '%s\n' "$out"
-          [ "$out" = "ok" ]
+      - name: Make the payload executable
+        run: chmod +x bin/* hooks/*.sh hooks/*.py tests/*.sh tests/*.py
 
-      - name: Policy suite
-        run: AWAY_TEST=1 python3 tests/policy_cases.py
+      # The installer refuses a payload whose guard cannot pass its own self-test,
+      # so a release that would be refused must never be published. run_all.sh is
+      # the same entry point CI and local runs use -- no third list of suites.
+      - name: All suites
+        run: bash tests/run_all.sh
 
       - name: Build the tarball
         run: |
