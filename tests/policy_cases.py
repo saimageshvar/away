@@ -141,7 +141,21 @@ CASES = [
     # --- away OFF: only real deletes may interrupt the operator
     ("off: compose run --rm", "docker compose run --rm web rails c", DEFER, False),
     ("off: rm as an argument", "grep -n rm README-away", DEFER, False),
-    ("off: a real delete", "rm scratch.txt", ASK, False),
+    # Away OFF, and the delete is scoped to the tree: it runs. Asking here asked
+    # about the deletes the guard could already prove were safe, which is most of
+    # them, and the answer was always yes.
+    ("off: in-tree file", "rm scratch.txt", ALLOW, False),
+    ("off: regenerable dir", "rm -rf node_modules", ALLOW, False),
+    ("off: temp file", "rm -f /tmp/away-off-scratch", ALLOW, False),
+    # ...and the ones that still need a human still get one. Same test handle_rm
+    # applies while armed; only the failure branch differs.
+    ("off: recursive on source", "rm -rf src", ASK, False),
+    ("off: outside the tree", "rm -rf ~/Documents/x", ASK, False),
+    ("off: root", "rm -rf /", ASK, False),
+    ("off: variable target", "rm -rf $TARGET", ASK, False),
+    ("off: hidden behind xargs", "find . -name '*.rb' | xargs rm", ASK, False),
+    ("off: cd out then delete", "cd /tmp && rm -rf ~/other", ASK, False),
+    ("off: shell payload", "sh -c 'rm -rf /Users/x'", ASK, False),
 ]
 
 

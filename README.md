@@ -26,6 +26,12 @@ When away mode is on, four hooks change how an agent behaves:
 - **Every denial and decision is logged**, so `away report` tells you what happened
   while you were gone.
 
+**With away mode off**, one rule remains: a delete scoped to the working tree runs
+without asking — snapshotted first if git cannot bring it back — and anything the
+guard cannot scope still asks: `rm -rf src`, a path outside the tree, a variable or
+glob target, a delete behind `xargs`, `find` or a shell payload, or a container
+exec. Snapshots are pruned after 14 days.
+
 The rules the agents follow are in [`rules.md`](rules.md). The hooks inject them,
 so they reach every repo and every subagent without you restating anything.
 

@@ -38,6 +38,13 @@ NAG_AFTER_HOURS = 8
 MAX_SNAPSHOT_BYTES = 50 * 1024 * 1024
 MAX_ASK_RETRIES = 3
 
+# Snapshots used to be taken only during an absence, so the trash grew slowly
+# enough that nothing ever pruned it. Now an ordinary in-tree delete is allowed
+# without a prompt and snapshotted on the way, which is many times a day rather
+# than a few times a week. Age alone, and one stat per bundle: a size cap would
+# mean walking every bundle on every delete.
+TRASH_MAX_AGE_DAYS = 14
+
 # Deleting these regenerates them, so they need no snapshot. Segment names only.
 EPHEMERAL = {
     "node_modules", "tmp", "temp", "log", "logs", "reports", "coverage",
@@ -1064,10 +1071,30 @@ def size_within(path, cap):
     return True, total
 
 
+def prune_trash():
+    """Drop snapshot bundles older than the retention window.
+
+    Never raises: this runs on the path that is about to make a delete
+    recoverable, and failing to tidy is not a reason to fail that.
+    """
+    cutoff = time.time() - TRASH_MAX_AGE_DAYS * 86400
+    try:
+        entries = list(TRASH.iterdir())
+    except Exception:
+        return
+    for entry in entries:
+        try:
+            if entry.is_dir() and entry.stat().st_mtime < cutoff:
+                shutil.rmtree(entry, ignore_errors=True)
+        except Exception:
+            continue
+
+
 def new_bundle(ctx, kind):
     """Claim a unique bundle dir. Concurrent agents can collide within a second."""
     base = "%s-%s-%s" % (time.strftime("%Y%m%d-%H%M%S"), ctx["session"][:6], kind)
     TRASH.mkdir(parents=True, exist_ok=True)
+    prune_trash()
     for suffix in [""] + ["-%d" % n for n in range(1, 1000)]:
         candidate = TRASH / (base + suffix)
         try:
@@ -1436,11 +1463,25 @@ def handle_container_delete(hook, cmd, inner):
     # defer, so the rest of the command still meets the normal permission rules
 
 
-def handle_rm(hook, cmd, calls, base=None):
+def handle_rm(hook, cmd, calls, base=None, armed=True):
+    """Judge a fully scoped delete.
+
+    `armed` decides only what happens when it does NOT pass. While away, a
+    failure is a denial and is logged, because nobody is there to answer. With
+    the operator at the keyboard it is an `ask`, which is what they would have
+    got anyway -- and nothing is logged, so the event log stays a record of
+    absences rather than of ordinary work.
+    """
     ctx = session_ctx(hook)
     if base:
         # A leading `cd` moved the root that relative paths resolve against.
         ctx = dict(ctx, cwd=base)
+
+    def block(reason, detail=None):
+        if armed:
+            deny(hook, "Bash", reason, detail=detail)
+        else:
+            emit_pretool("ask", "This delete needs you: %s" % reason)
 
     # Pass 1: everything decidable without git, so a blocker short-circuits
     # before any subprocess runs.
@@ -1454,10 +1495,9 @@ def handle_rm(hook, cmd, calls, base=None):
         for raw in paths:
             kind, target = classify_static(raw, ctx["cwd"])
             if kind in blockers:
-                deny(hook, "Bash",
-                     "%s (%s). Delete only resolvable paths inside the working tree."
-                     % (blockers[kind], raw),
-                     detail={"command": cmd, "target": raw, "class": kind})
+                block("%s (%s). Delete only resolvable paths inside the working tree."
+                      % (blockers[kind], raw),
+                      detail={"command": cmd, "target": raw, "class": kind})
                 return
             staged.append((raw, kind, target, recursive))
 
@@ -1477,32 +1517,31 @@ def handle_rm(hook, cmd, calls, base=None):
         if recursive and kind not in ("ephemeral", "scratch"):
             bad_recursive = raw
     if bad_recursive:
-        deny(hook, "Bash",
-             "a recursive delete may only target regenerable paths, and %s is not "
-             "one." % bad_recursive,
-             detail={"command": cmd,
-                     "verdicts": [[r, k] for r, k, _t in verdicts]})
+        block("a recursive delete may only target regenerable paths, and %s is not "
+              "one." % bad_recursive,
+              detail={"command": cmd,
+                      "verdicts": [[r, k] for r, k, _t in verdicts]})
         return
     if not verdicts:
-        deny(hook, "Bash", "a delete has no explicit target path.",
-             detail={"command": cmd})
+        block("a delete has no explicit target path.", detail={"command": cmd})
         return
 
     bundle = None
     if to_snapshot:
         bundle, err = snapshot_paths(to_snapshot, ctx, cmd, best_effort=optional)
         if err:
-            deny(hook, "Bash", "the delete is unrecoverable and %s." % err,
-                 detail={"command": cmd})
+            block("the delete is unrecoverable and %s." % err,
+                  detail={"command": cmd})
             return
-    rec = {"ts": now_iso(), "event": "rm_allowed", "tool": "Bash",
-           "tool_use_id": hook.get("tool_use_id"),
-           "detail": {"command": cmd,
-                      "verdicts": [[r, k] for r, k, _t in verdicts],
-                      "snapshot": str(bundle) if bundle else None},
-           "rule": "away: delete is inside the tree and recoverable"}
-    rec.update(ctx)
-    log_event(rec)
+    if armed:
+        rec = {"ts": now_iso(), "event": "rm_allowed", "tool": "Bash",
+               "tool_use_id": hook.get("tool_use_id"),
+               "detail": {"command": cmd,
+                          "verdicts": [[r, k] for r, k, _t in verdicts],
+                          "snapshot": str(bundle) if bundle else None},
+               "rule": "away: delete is inside the tree and recoverable"}
+        rec.update(ctx)
+        log_event(rec)
     # An explicit allow covers the WHOLE command, so a chain only ever defers to
     # the normal rules. rm is no longer in the ask list, so defer still runs it.
     if not single_segment(cmd):
@@ -1511,8 +1550,9 @@ def handle_rm(hook, cmd, calls, base=None):
     where = ("the working tree or a temp directory"
              if any(k == "scratch" for _r, k, _t in verdicts)
              else "the working tree")
-    emit_pretool("allow", "AWAY MODE. Delete allowed: every target is inside %s "
-                          "and recoverable.%s" % (where, note))
+    emit_pretool("allow", "%sDelete allowed: every target is inside %s and "
+                          "recoverable.%s"
+                 % ("AWAY MODE. " if armed else "", where, note))
 
 
 def handle_git_destructive(hook, cmd):
@@ -1565,11 +1605,24 @@ def handle_pretooluse(hook):
         calls = rm_invocations(cmd)
 
         if not on:
-            # Away is OFF and we only reached python for rm, so reproduce the
-            # `ask` rule this hook replaced. Everything else defers untouched.
-            if deletes or calls:
-                emit_pretool("ask", "This deletes files. Away mode is off, so it is "
-                                    "the operator's call.")
+            # Away is OFF, so the only job left is the `ask` on deletes that this
+            # hook took over from the permission list. But asking about EVERY
+            # delete asks about the ones it can already prove are safe: a target
+            # inside the working tree, non-recursive or regenerable, snapshotted
+            # if git cannot bring it back. That is the same test handle_rm
+            # applies while armed, and passing it is the whole reason the answer
+            # would have been yes. So run it, and keep the prompt for the deletes
+            # that genuinely need a human.
+            if not (deletes or calls):
+                return
+            cwd_now = hook.get("cwd") or os.getcwd()
+            if calls and container_inner(cmd) is None:
+                base, err = effective_base(cmd, cwd_now)
+                if not err and not unscopable(cmd, calls):
+                    handle_rm(hook, cmd, calls, base, armed=False)
+                    return
+            emit_pretool("ask", "This deletes files and its targets cannot be scoped "
+                                "to the working tree, so it is your call.")
             return
 
         # Outward ops are checked first and across the whole command, so an rm

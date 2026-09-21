@@ -1,5 +1,35 @@
 # Changelog
 
+## 1.3.0
+
+**Away OFF: a delete scoped to the working tree now runs without asking.**
+
+The hook took the `ask`-on-delete rule over from the permission list, and then
+asked about every delete -- including the ones it could already prove were safe.
+That is a prompt for `rm node_modules/x` and for `rm a-file-you-just-wrote`, and
+the answer was always yes.
+
+It now runs the same test `handle_rm` applies while armed: every target resolvable
+and inside the working tree, recursion only onto regenerable paths, and a snapshot
+taken first for anything git cannot bring back. Passing that test is the whole
+reason the answer would have been yes, so passing it is enough.
+
+Only the failure branch differs by state. Armed, a failure is a denial and is
+logged, because nobody is there to answer. With the operator present it is an
+`ask`, exactly as before, and nothing is logged -- the event log stays a record of
+absences rather than of ordinary work.
+
+Still asks, unchanged: `rm -rf src`, anything outside the tree, a variable or glob
+target, a delete behind `xargs`/`find`/a shell payload, and a container exec.
+
+- **The trash is pruned at 14 days.** Snapshots used to be taken only during an
+  absence, so nothing ever pruned them and nothing needed to. An allowed in-tree
+  delete is now many times a day. Age only, one stat per bundle: a size cap would
+  mean walking every bundle on every delete.
+- Only what git cannot recover is snapshotted. A tracked-clean file and a
+  `node_modules` are allowed with no bundle at all -- four deletes in the test
+  produce two bundles.
+
 ## 1.2.1
 
 `away decision` was denying itself, which is the one command an absence depends on
