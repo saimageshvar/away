@@ -1,5 +1,50 @@
 # Changelog
 
+## 1.4.0
+
+Adversarial review broke the delete-relax path from 1.2.0 inside an hour. It is removed.
+
+It let the on-device model's output turn a deny into an allow: the model extracted a
+command's delete paths and the deterministic code judged those paths. Three things were
+named as holding the line, and all three failed a first-hour probe.
+
+- **The prompt was escapable.** It wrapped the command in `<<< >>>`, so a command
+  *containing* `>>>` closed the wrapper and supplied its own `Paths deleted:` answer.
+  That breakout allowed `shutil.rmtree($HOME/Documents)` -- reproduced, and now a test
+  case.
+- **The recursion rule was never carried over.** `cd <sibling> && rm -rf src` ran where
+  a plain `rm -rf src` was denied.
+- **The undo bundle was not a backstop.** It is size-capped, it was passed
+  `best_effort` on every path, and `git_undo_bundle` writes an empty patch and returns
+  no error when git fails. For a 60MB untracked directory it captured nothing, while
+  the docs claimed "a full undo bundle captured before anything is allowed".
+
+What replaces it is what recovered most of the value anyway: **21 of those 43 denials
+were one thing -- "the cd target is outside the working tree"** -- and widening the base
+to any checkout or scratch directory fixes them with no model at all. `handle_rm` then
+applies every rule it always did against that base. The model bought about three
+denials beyond that, and cost a breakout.
+
+**No model output can cause an allow anywhere in this guard now.** `fm` is consulted in
+one place, to *add* an outward denial, where being wrong costs a prompt.
+
+Also fixed, all from the same review:
+
+- **The tamper exemption leaked through glued redirects.** Only a bare `>` token was
+  checked, so `away decision x >~/.claude/away/hooks/guard.py` and the `2>` form both
+  walked through -- shlex keeps the glued form as one token. Every redirect form is
+  now rejected.
+- **`EPHEMERAL` matched a path component by name**, so a directory called `tmp` holding
+  the only copy of something was deleted with no snapshot, and after 1.3.0 with no
+  prompt either. Names that settle it on their own (`node_modules`, `__pycache__`,
+  `.venv`...) still do; the ordinary English ones (`tmp`, `log`, `build`, `dist`,
+  `target`, `reports`, `coverage`) now need the repo to actually gitignore them.
+- Documentation claimed "zero false positives across the 400" for the whole guard. The
+  model pass fires on one of the 400; the layered guard denies 8. Corrected in both
+  places.
+
+Tests 138 -> 144.
+
 ## 1.3.1
 
 `Rm -rf /Users/x` ran unprompted with away mode off.

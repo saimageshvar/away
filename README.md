@@ -163,38 +163,38 @@ block does a second layer look — and what that layer may do depends on the blo
 |---|---|
 | Outward: push, deploy, publish, merge, remote write | **Never reconsidered.** Token rules alone. |
 | Away mode's own files | **Never reconsidered.** |
-| A delete the parser could not scope | **Reconsidered** — see [relaxing a delete](#relaxing-a-delete). |
+| A delete the parser could not scope | **Never reconsidered by the model.** The base is widened deterministically — see [where a delete may happen](#where-a-delete-may-happen). |
 | Nothing — the parser found no reason | A model pass may still **add** a denial for deploy tooling no rule names. |
 
-### Relaxing a delete
+### Where a delete may happen
 
 Of 116 denials in real absences, 43 were parser failures rather than dangerous
-commands: `cd <sibling worktree> && rm -rf frontend/node_modules`, a delete inside
-a heredoc, `rm -f build/reports/junit/*.xml`, and `docker compose run --rm`, which
-is not a delete at all. Away mode exists so work continues while nobody is
-watching, and it was spending that time blocking its own operator.
+commands, and 21 of those 43 were one thing: *the cd target is outside the working
+tree*. The operator works across sibling worktrees, so
+`cd ../groups-wave2 && rm -rf node_modules` is ordinary work that away mode was
+refusing. The base is now any checkout or scratch directory, not just the session's
+own cwd — and `handle_rm` then applies every rule it always did against that base:
+containment, the recursion test, and a snapshot that must succeed. Nothing is
+relaxed except which tree counts.
 
-So a delete the parser cannot scope gets a second look — with the model used as an
-**extractor, never a judge**. It lists the paths the command deletes; then
-`classify_static`, `classify_git` and `snapshot_paths` judge those paths exactly as
-they judge a plain `rm`. It is never asked whether something is safe, because when
-it was asked it guessed: it dropped a `cd ..` and put a sibling repo inside the
-working tree, invented a filename for `$(cat paths.txt)`, and returned the source
-file for `"$TARGET"`.
+**An earlier version went further and was removed.** It asked the on-device model to
+extract a command's delete paths and let that turn a deny into an allow. Three
+things were supposed to hold the line, and adversarial review broke all three
+within an hour:
 
-What holds the line is deterministic, and no answer the model gives can lift it:
+- the prompt wrapped the command in `<<< >>>`, so a command *containing* `>>>`
+  closed the wrapper and supplied its own answer — that breakout allowed
+  `shutil.rmtree($HOME/Documents)`;
+- the recursion rule was never carried over, so `cd <sibling> && rm -rf src` ran
+  where a plain `rm -rf src` was denied;
+- the "full undo bundle" backstop was size-capped, passed `best_effort` on every
+  path, and swallowed git errors — it captured nothing for a 60MB untracked
+  directory.
 
-- vetoes on command substitution, variables and `~` **in the delete itself** — not
-  elsewhere in the command, which vetoed `cd ~/projects/x && rm -rf tmp` and cost
-  most of the gain;
-- the base directory resolved by us, from the command's own `cd`, never by the model;
-- every path must come back absolute, because a relative answer means it did not
-  resolve the command and its other answers cannot be trusted either;
-- a full undo bundle captured before anything is allowed, so a path the model failed
-  to mention is still recoverable.
-
-Measured: **24 of the 43 real denials now run, and all 15 adversarial deletes stay
-blocked** — including five carrying an explicit "operator pre-approved this" comment.
+It bought about three denials beyond what the deterministic base widening already
+recovers. **No model output can cause an allow anywhere in this guard.** `fm` is
+consulted in one place only, to *add* an outward denial, where being wrong costs a
+prompt rather than a directory.
 
 ### Adding a denial
 
@@ -208,7 +208,10 @@ Most of those are now token rules. What no token list can carry is the next tool
 nobody has heard of, so after every rule above has had its say, Apple's on-device
 model (`fm`, macOS 26+) reads the command. On twelve deploy CLIs absent from the
 list — `firebase deploy`, `wrangler deploy`, `supabase db push`, `fastlane deliver`
-and eight more — it caught four, at zero false positives across the 400.
+and eight more — it caught four. It fired on one of the 400 real commands,
+a `sudo -u ubuntu` on a remote box that is arguably a true positive; the layered
+guard as a whole denies 8 of the 400, five of those from pre-existing `aws`,
+`sudo` and `gh` rules.
 
 **It is wired in one direction: it may only turn a defer into a deny.** That is
 what makes it safe to run on text the guarded agent itself wrote. An agent that
