@@ -29,6 +29,11 @@ because the command was not found.
 - Any action that needs operator approval is unavailable. Route around it or defer it.
 - Never retry a denied command. The denial will not change while the operator is away.
 - `git push` is never yours while away. Commit the work and leave it unpushed.
+- Anything reaching off this machine is the operator's: deploys, releases, publishes, a
+  remote shell, a write to a remote database or service. A denial may name a tool no
+  written rule lists — an on-device model reads the command too, and it can only ever
+  add a denial, never grant one. Rewording a command to look harmless is not a route
+  around the rule. Defer the work and say so.
 
 ## Keep the tree clean
 

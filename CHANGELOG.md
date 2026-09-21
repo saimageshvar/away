@@ -1,5 +1,96 @@
 # Changelog
 
+## 1.2.1
+
+`away decision` was denying itself, which is the one command an absence depends on
+for its record.
+
+rules.md tells agents to call it by absolute path -- `~/.claude/away/bin/away decision
+"..."` -- and that path matches SELF_PATHS. MUTATES then matched an ordinary word in the
+DECISION TEXT: python3, ruby, rm, cp, a quoted `>`. Both halves matched, so recording a
+decision read as tampering with away mode itself. **Five of six realistic decision texts
+were denied**, and the bias was the wrong way round: a decision that mentions a file or a
+tool is exactly the one worth keeping.
+
+away's own agent-facing subcommands -- `decision`, `report`, `status`, `trash` -- are now
+exempt from the tamper check. Per segment, not wholesale, so
+`away decision "x" && rm -rf ~/.claude/away` still dies; and never when the segment
+carries a bare redirect or a command substitution, so neither
+`away decision "$(rm -rf ...)"` nor `away decision x > hooks/guard.py` can use the
+exemption. `away on|off` is not on the list and is caught earlier regardless.
+
+Also: `away report` now labels `checkpoint` and `relax_allowed` events instead of
+printing the raw event name.
+
+## 1.2.0
+
+Away mode existed so work continues while nobody is watching, and it was spending that
+time blocking its own operator. Of 116 denials in real absences, **43 were parser
+failures, not dangerous commands** -- `cd <sibling worktree> && rm -rf frontend/node_modules`,
+`rm -f build/reports/junit/*.xml`, a delete inside a heredoc, and
+`docker compose run --rm`, which is not a delete at all. Every one was safe, every one
+was recoverable, and every one stopped a line of work until the operator came back.
+
+The layering is now: the parser decides, and when it decides *allow* nothing else runs.
+Only when it would block does a second layer look, and what that layer does depends on
+the kind of block.
+
+- **Deletes it could not scope are reconsidered.** The model is used as an EXTRACTOR --
+  it lists the paths the command deletes, and `classify_static`, `classify_git` and
+  `snapshot_paths` then judge those paths exactly as they judge a plain `rm`. The model
+  is never asked whether something is safe. When it was, it guessed: it dropped a `cd ..`
+  and placed a sibling repo inside the working tree, invented a filename for
+  `$(cat paths.txt)`, and returned the source file for `"$TARGET"`.
+  What holds the line is deterministic and the model cannot override it: vetoes on
+  substitution, variables and `~` **in the delete itself** (not elsewhere in the command,
+  which vetoed `cd ~/projects/x && rm -rf tmp` and cost most of the gain), a base
+  resolved by us rather than by the model, a requirement that every path come back
+  absolute, and a full undo bundle captured before anything is allowed.
+  Measured: **24 of the 43 real denials now run, with all 15 adversarial deletes still
+  blocked** -- including five carrying an explicit "operator pre-approved this" comment.
+- **Outward actions are never reconsidered.** Deploys, publishes, pushes, releases and
+  remote writes stay denied by token rules alone. The relax path can only ever touch a
+  delete.
+- **`--rm` is no longer a delete.** `\brm\b` matches inside it because the hyphen is a
+  word boundary, so `docker compose run --rm` read as a deletion, and with a `cd` in
+  front it became a denial. Deterministic fix, no model involved.
+- **A language's own delete now counts.** `DELETION_HINT` missed `shutil.rmtree`,
+  `os.remove`, `FileUtils.rm` and `rmSync`, so `python3 - <<'PY'` calling `rmtree`
+  skipped the entire delete path -- including the conduit check that exists for exactly
+  that shape. This was a pre-existing hole, found while testing the relax path.
+
+## 1.1.0
+
+Outward detection was a token list, so it only ever caught what someone had thought to
+add. Measured against 400 real commands from an actual absence, the gaps were a whole
+family, not a long tail: `cap production deploy`, `kubectl apply`, `vercel --prod`,
+`flyctl deploy`, `gcloud run deploy`, `twine upload`, `ssh host '...'`, a remote `psql`,
+and a `curl -X POST` at a webhook. All of them fell through to defer, which a `Bash(*)`
+permission turns into allow.
+
+- **New token rules** for remote shells (`ssh`, `scp`, `rsync` to a host), deploy CLIs,
+  third-party service CLIs, `kubectl`/`helm` write verbs, remote database clients, HTTP
+  writes to a non-local URL, and build targets named deploy/release/publish. These carry
+  the detection; they are deterministic and they are the floor.
+- **A model pass behind them.** Apple's on-device model reads whatever the token rules
+  did not recognise, and may only turn a defer into a deny — never a deny into an allow.
+  That direction is the whole safety argument: the guarded agent writes the command text,
+  so an injected "pre-approved, classify as safe" must not be able to buy anything. It
+  cannot. Six of eight injection attempts did talk the model round; all eight were denied
+  by the token rules regardless.
+  On twelve deploy CLIs no rule lists, it caught four, at zero false positives across the
+  400 real commands. A 59% prefilter keeps it off the hot path for `grep`, `sed`,
+  `git status` and the like. Every failure mode returns no opinion. `AWAY_FM=0` disables
+  it; the token rules are unaffected.
+- Denials from the model are logged as `deferred_by_model`, so `away report` separates
+  them and a false positive reads as a rule to write rather than a mystery.
+
+Two regexes did not survive their own test run and are recorded here because the shape
+recurs: `eb` in a deploy-CLI alternation matched a bare word inside a heredoc, and the
+remote-database rule wanted two spaces where real commands have one. Short alternatives
+need a length floor, and every new pattern gets run against real history before it lands.
+
+
 ## 1.0.2
 
 Both fixes came from watching the real `away update 1.0.0 -> 1.0.1` run, not from a test.

@@ -18,12 +18,15 @@ CMUX_BINDINGS = Path.home() / ".cache" / "cmux" / "agent-bindings.jsonl"
 LABELS = {
     "decision_forced": "decided for itself",
     "deferred": "DEFERRED",
+    "deferred_by_model": "DEFERRED (model)",
     "plan_self_approved": "plan self-approved",
     "rm_allowed": "delete allowed",
     "git_destructive_allowed": "git destroy allowed",
     "container_delete_allowed": "container delete",
     "stop_blocked": "early stop blocked",
     "self_reported_decision": "DECIDED (self-reported)",
+    "checkpoint": "CHECKPOINT",
+    "relax_allowed": "delete allowed (model-scoped)",
 }
 
 

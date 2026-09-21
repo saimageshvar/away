@@ -64,8 +64,13 @@ elif [ "$EVENT" = "pretooluse" ]; then
   # removed from the permission list to give this hook sole authority.
   case "$input" in
     *'"tool_name"'*'"Bash"'*)
+      # Keep these in step with DELETION_HINT in guard.py. They diverged once:
+      # the constant grew `os.remove` and `File.delete`, but neither has an "rm"
+      # in it and neither carries the hyphen `-delete` wanted, so while away was
+      # OFF they never reached python and never asked. Armed, every Bash call
+      # reaches python anyway, which is exactly why the gap was invisible.
       case "$input" in
-        *rm*|*RM*|*unlink*|*shred*|*-delete*) need_python=1 ;;
+        *rm*|*RM*|*unlink*|*shred*|*remove*|*delete*|*Delete*) need_python=1 ;;
       esac ;;
   esac
 elif [ "$EVENT" = "userpromptsubmit" ]; then
