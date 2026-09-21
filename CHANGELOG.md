@@ -1,5 +1,34 @@
 # Changelog
 
+## 1.3.1
+
+`Rm -rf /Users/x` ran unprompted with away mode off.
+
+There are two delete detectors and one gates the other. While armed, guard.sh routes
+every Bash call to python, so DELETION_HINT alone decides. While OFF, guard.sh's shell
+glob decides whether python runs AT ALL -- so a form DELETION_HINT knows but the glob
+does not is a delete that runs with no prompt. DELETION_HINT is `re.I`; the glob was
+not. APFS is case-insensitive, so `Rm` really does execute /bin/rm, as the comment on
+delete_shaped has said all along.
+
+That is the second divergence between the two. The first was vocabulary: DELETION_HINT
+grew `os.remove` and `File.delete`, and neither has an "rm" in it nor the hyphen that
+`-delete` wanted. Both were invisible while armed, which is the state anyone would
+test first.
+
+- The glob now matches case-insensitively (`shopt -s nocasematch`, scoped to that one
+  `case`), and drops the hand-added `*RM*` and `*Delete*` variants it no longer needs.
+- **A test now reads the terms out of DELETION_HINT and asserts guard.sh routes every
+  one of them, in three cases each.** Adding a term to the constant without teaching
+  the glob fails the suite. Verified by reintroducing the bug: 20 failures, all naming
+  the unrouted variant.
+  It asserts on routing alone, against a stubbed guard.py -- the real guard stays
+  silent for a command that is delete-shaped by vocabulary but has no delete in
+  command position, and reading that silence as "not routed" made an earlier version
+  of this test assert the wrong thing.
+
+Tests 96 -> 138.
+
 ## 1.3.0
 
 **Away OFF: a delete scoped to the working tree now runs without asking.**

@@ -64,14 +64,20 @@ elif [ "$EVENT" = "pretooluse" ]; then
   # removed from the permission list to give this hook sole authority.
   case "$input" in
     *'"tool_name"'*'"Bash"'*)
-      # Keep these in step with DELETION_HINT in guard.py. They diverged once:
-      # the constant grew `os.remove` and `File.delete`, but neither has an "rm"
-      # in it and neither carries the hyphen `-delete` wanted, so while away was
-      # OFF they never reached python and never asked. Armed, every Bash call
-      # reaches python anyway, which is exactly why the gap was invisible.
+      # Keep these in step with DELETION_HINT in guard.py; tests/policy_cases.py
+      # fails if they drift. They have diverged twice. Once on vocabulary: the
+      # constant grew `os.remove` and `File.delete`, and neither has an "rm" in
+      # it nor the hyphen that `-delete` wanted. Once on case: DELETION_HINT is
+      # re.I and this was not, so `Rm -rf x` skipped python entirely -- and APFS
+      # is case-insensitive, so that really does run /bin/rm.
+      #
+      # Both were invisible while armed, because armed routes every Bash call to
+      # python and this glob never runs at all.
+      shopt -s nocasematch
       case "$input" in
-        *rm*|*RM*|*unlink*|*shred*|*remove*|*delete*|*Delete*) need_python=1 ;;
-      esac ;;
+        *rm*|*unlink*|*shred*|*remove*|*delete*) need_python=1 ;;
+      esac
+      shopt -u nocasematch ;;
   esac
 elif [ "$EVENT" = "userpromptsubmit" ]; then
   # A session that armed itself with --here ends alone, so the global file is

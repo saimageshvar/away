@@ -194,6 +194,61 @@ def cli_cases(tree):
     return found
 
 
+def deletion_hint_drift_cases(tree):
+    """guard.sh's glob must fire for everything DELETION_HINT fires for.
+
+    Two independent delete detectors exist, and one gates the other. While away
+    is OFF, guard.sh's glob decides whether python runs AT ALL, so a form that
+    DELETION_HINT knows but the glob does not is a delete that runs unprompted.
+    While armed the glob never runs, so every divergence is invisible in exactly
+    the state anyone would test first. It has happened twice: once on vocabulary
+    (`os.remove`, `File.delete`), once on case (`Rm`, and APFS is
+    case-insensitive so that really does run /bin/rm).
+
+    The terms are read out of guard.py rather than written down here, so adding
+    one to the constant without teaching the glob fails this test.
+    """
+    import re as _re
+    src = (HOME / "hooks" / "guard.py").read_text(encoding="utf-8")
+    block = _re.search(r"DELETION_HINT = re\.compile\((.*?)\, re\.I\)", src, _re.S)
+    if not block:
+        return ["could not find DELETION_HINT in guard.py"], 1
+    # Rebuild the literals by undoing the regex syntax, then splitting the
+    # alternation. Scraping words out of the raw source instead picked up `bDir`
+    # from `\bDir` and asserted on fragments that are not commands.
+    body = "".join(_re.findall(r'r"([^"]*)"', block.group(1)))
+    body = (body.replace(r"\b", "").replace(r"\w*", "")
+                .replace(r"\s+", " ").replace(r"\.", "."))
+    body = _re.sub(r"[()]", "", body)
+    terms = [t for t in (part.strip() for part in body.split("|")) if t]
+    sandbox = Path(tempfile.mkdtemp(prefix="away-drift-"))
+    (sandbox / "state").mkdir(parents=True)
+    shutil.copytree(HOME / "hooks", sandbox / "hooks")
+    # Only ROUTING is under test here, so guard.py is replaced by a stub that
+    # always speaks. The real guard stays silent for a command that is
+    # delete-shaped by vocabulary but has no delete in command position, and
+    # reading that silence as "not routed" made this assert the wrong thing.
+    (sandbox / "hooks" / "guard.py").write_text("print('ROUTED')\n", encoding="utf-8")
+
+    found, ran = [], 0
+    for term in terms:
+        for variant in (term, term.upper(), term.capitalize()):
+            payload = json.dumps({"session_id": "drift", "cwd": str(tree),
+                                  "tool_name": "Bash",
+                                  "tool_input": {"command": "%s /Users/x" % variant}})
+            proc = subprocess.run(
+                ["bash", str(sandbox / "hooks" / "guard.sh"), "pretooluse"],
+                input=payload, capture_output=True, text=True, timeout=60,
+                env=dict(os.environ, AWAY_HOME=str(sandbox), AWAY_TEST="1"))
+            ran += 1
+            # Away is OFF (no flag written), so this glob is the only gate.
+            if "ROUTED" not in proc.stdout:
+                found.append("guard.sh's glob does not route %r to python, but "
+                             "DELETION_HINT matches it" % variant)
+    shutil.rmtree(sandbox, ignore_errors=True)
+    return found, ran
+
+
 def model_cases(tree):
     """The model pass may only ADD denials, and may never wedge the guard.
 
@@ -386,6 +441,9 @@ def main():
     failures += cli_cases(tree)
     failures += resilience_cases(tree)
     ran += 7
+    drift_failures, drift_ran = deletion_hint_drift_cases(tree)
+    failures += drift_failures
+    ran += drift_ran
     model_failures, model_ran = model_cases(tree)
     failures += model_failures
     ran += model_ran
