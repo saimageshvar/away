@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.5.0
+
+The hand-back now reaches the operator's phone. With a Slack Ping workflow configured
+(`~/.config/slack-ping/webhook_url` + `user_id`), the Stop hook asks the agent once per
+hand-back to end on a plain-text status report — progress, blocked, what I got wrong — and
+then sends that final message as a Slack DM itself.
+
+- **The hook sends, not the agent.** An agent's POST to a webhook is the outward write
+  the guard denies, and letting the agent pass the recipient would let it DM anyone.
+- **It cannot loop.** The report is requested at most once per hand-back; if the next
+  stop has no text, it is skipped and the stop is accepted. The existing denial nudge
+  still fires first.
+- **Off unless configured**, so installs without Slack Ping behave exactly as before.
+
 ## 1.4.0
 
 Adversarial review broke the delete-relax path from 1.2.0 inside an hour. It is removed.

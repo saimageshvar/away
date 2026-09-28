@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tarfile
 import time
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -33,6 +34,11 @@ TRASH = STATE / "trash"
 ENDED = STATE / "ended.json"
 SESSION_ENDED = STATE / "sessions-ended"
 RULES = AWAY / "rules.md"
+
+# Slack Ping: a Slack workflow webhook that DMs the operator. Opt-in by the two
+# files existing; the URL is the operator's own, so it never lives in this repo.
+PING = Path(os.environ.get("SLACK_PING_HOME") or (Path.home() / ".config" / "slack-ping"))
+PING_TIMEOUT = 8
 
 NAG_AFTER_HOURS = 8
 MAX_SNAPSHOT_BYTES = 50 * 1024 * 1024
@@ -1653,16 +1659,22 @@ def handle_permissionrequest(hook):
     emit_permreq("deny")
 
 
-def handle_stop(hook):
-    """Block an early hand-back once, when a denial went unresolved this session.
+STOP_EVENTS = ("stop_blocked", "ping_requested", "ping_sent", "ping_failed",
+               "ping_skipped")
 
-    Capped at one block per session. A second attempt always succeeds, so a
-    misjudgement here can never trap an agent in a loop.
+
+def handle_stop(hook):
+    """Block an early hand-back once, when a denial went unresolved this session,
+    then ask for a Slack Ping status report before the stop that is accepted.
+
+    The nudge is capped at one per session and the report at one per hand-back,
+    so a misjudgement here can never trap an agent in a loop.
     """
     session = hook.get("session_id") or "unknown"
     if not away_on(session):
         return
     denied = blocked = False
+    last_stop = None
     for line in tail_lines(EVENTS, 800):
         try:
             rec = json.loads(line)
@@ -1674,7 +1686,10 @@ def handle_stop(hook):
             denied = True
         if rec.get("event") == "stop_blocked":
             blocked = True
+        if rec.get("event") in STOP_EVENTS:
+            last_stop = rec.get("event")
     if not denied or blocked:
+        ping_on_stop(hook, session, last_stop)
         return
     ctx = session_ctx(hook)
     rec = {"ts": now_iso(), "event": "stop_blocked", "tool": "Stop",
@@ -1690,6 +1705,96 @@ def handle_stop(hook):
             "what you deferred, the evidence, and your recommendation. This "
             "nudge fires only once, so your next stop will be accepted."
             + note_suffix(session)),
+    }))
+
+
+def ping_config():
+    """(webhook, user id) when the operator has set Slack Ping up, else None."""
+    try:
+        url = (PING / "webhook_url").read_text(encoding="utf-8").strip()
+        uid = (PING / "user_id").read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return (url, uid) if url and uid else None
+
+
+def send_ping(url, uid, message):
+    body = json.dumps({"message": message, "userId": uid}).encode("utf-8")
+    req = urllib.request.Request(url, data=body,
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=PING_TIMEOUT) as resp:
+        return resp.status == 200
+
+
+def last_assistant_text(hook):
+    """The agent's final message, from the hook field or the transcript's tail."""
+    text = hook.get("last_assistant_message")
+    if isinstance(text, str) and text.strip():
+        return text.strip()
+    for line in reversed(tail_lines(hook.get("transcript_path") or "", 200)):
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue
+        if rec.get("type") != "assistant":
+            continue
+        content = (rec.get("message") or {}).get("content")
+        if isinstance(content, str):
+            parts = [content]
+        else:
+            parts = [c.get("text", "") for c in content or []
+                     if isinstance(c, dict) and c.get("type") == "text"]
+        joined = "\n".join(p for p in parts if p).strip()
+        if joined:
+            return joined
+    return ""
+
+
+def ping_on_stop(hook, session, last_stop):
+    """Have the agent end on a status report, then send that message from here.
+
+    The hook sends it, not the agent: an agent's own POST to a webhook is exactly
+    the outward write this guard denies, and the recipient stays pinned to the
+    operator instead of whatever id the agent passes.
+    """
+    config = ping_config()
+    if not config:
+        return
+    ctx = session_ctx(hook)
+
+    def log(event):
+        rec = {"ts": now_iso(), "event": event, "tool": "Stop", "detail": None,
+               "rule": "away: status report to Slack Ping"}
+        rec.update(ctx)
+        log_event(rec)
+
+    if hook.get("stop_hook_active") and last_stop == "ping_requested":
+        text = last_assistant_text(hook)
+        if not text:
+            log("ping_skipped")
+            return
+        try:
+            ok = send_ping(config[0], config[1], text)
+        except Exception as exc:
+            print("away-guard: slack ping failed: %s" % exc, file=sys.stderr)
+            ok = False
+        log("ping_sent" if ok else "ping_failed")
+        return
+    log("ping_requested")
+    print(json.dumps({
+        "decision": "block",
+        "reason": (
+            "AWAY MODE. Before you stop, end your turn with one final message "
+            "that is a status report for the operator, and nothing else. This "
+            "hook sends that message to them as a Slack DM, so do not send it "
+            "yourself.\n"
+            "Plain text only: Slack formatting such as *bold*, backticks, > and "
+            "markdown headings shows literally. First line: ✅ done, ❌ failed or "
+            "⏸️ needs input, then the repo or task and the outcome. Then "
+            "UPPERCASE headings PROGRESS, BLOCKED and WHAT I GOT WRONG, each with "
+            "• bullets. Give every deferred item its evidence and your "
+            "recommendation. No secrets or customer data. Your next stop will be "
+            "accepted."),
     }))
 
 

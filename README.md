@@ -25,6 +25,13 @@ When away mode is on, four hooks change how an agent behaves:
 - **Unrecoverable deletes are snapshotted first**, into `away trash`, then allowed.
 - **Every denial and decision is logged**, so `away report` tells you what happened
   while you were gone.
+- **Hand-backs reach your phone**, if you use a Slack Ping workflow. Before the stop
+  that is accepted, the agent is asked once to end on a status report, and the hook
+  sends that message to you as a Slack DM. The hook sends it, not the agent, so the
+  outward-write rule stays intact and the recipient is always you. To turn it on, put
+  the workflow's webhook URL in `~/.config/slack-ping/webhook_url` and your Slack
+  member ID in `~/.config/slack-ping/user_id`. The workflow takes
+  `{"message", "userId"}`.
 
 **With away mode off**, one rule remains: a delete scoped to the working tree runs
 without asking — snapshotted first if git cannot bring it back — and anything the
@@ -280,6 +287,7 @@ Two failures are worth knowing by name:
 | `AWAY_TEST` | unset | Tag events as synthetic. **Set this on every test run.** |
 | `AWAY_FM` | unset | `0` disables the model pass. `1` forces it on under a sandboxed `AWAY_HOME`, where it is off by default. |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Where `settings.json` and `skills/` live. |
+| `SLACK_PING_HOME` | `~/.config/slack-ping` | Holds `webhook_url` and `user_id` for the hand-back report. Neither file present = off. |
 
 ## Adapting the rules to your team
 

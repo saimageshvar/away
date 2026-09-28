@@ -418,6 +418,73 @@ def resilience_cases(tree):
     return found
 
 
+def ping_cases(tree):
+    """The hand-back report: asked for once per stop, sent from the hook, never looped."""
+    import http.server
+    import threading
+
+    received = []
+
+    class Hook(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            received.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'{"ok":true}')
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Hook)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    sandbox = Path(tempfile.mkdtemp(prefix="away-ping-"))
+    (sandbox / "state").mkdir(parents=True)
+    ping = sandbox / "slack-ping"
+    ping.mkdir()
+    (ping / "user_id").write_text("U0TEST\n")
+    (ping / "webhook_url").write_text("http://127.0.0.1:%d/hook\n" % server.server_port)
+    transcript = sandbox / "t.jsonl"
+    transcript.write_text(json.dumps({"type": "assistant", "message": {"content": [
+        {"type": "text", "text": "✅ repo: done\n\nPROGRESS\n• shipped"}]}}) + "\n")
+
+    def stop(active, armed=True):
+        flag = sandbox / "state" / "active.json"
+        if armed:
+            flag.write_text('{"on":true,"since_epoch":1}')
+        elif flag.exists():
+            flag.unlink()
+        payload = {"session_id": "pingtest", "cwd": str(tree), "stop_hook_active": active,
+                   "transcript_path": str(transcript)}
+        proc = subprocess.run(
+            [sys.executable, str(GUARD), "stop"], input=json.dumps(payload),
+            capture_output=True, text=True, timeout=60,
+            env=dict(os.environ, AWAY_HOME=str(sandbox), AWAY_TEST="1",
+                     SLACK_PING_HOME=str(ping)))
+        return "block" if '"block"' in proc.stdout else "allow"
+
+    found = []
+    if stop(False, armed=False) != "allow" or received:
+        found.append("ping: a stop with away mode off was touched")
+    if stop(False) != "block":
+        found.append("ping: the hand-back did not ask for a status report")
+    if stop(True) != "allow":
+        found.append("ping: the stop after the report was not accepted")
+    if [r.get("userId") for r in received] != ["U0TEST"] \
+            or not received[0].get("message", "").startswith("✅ repo: done"):
+        found.append("ping: the report was not sent to the operator: %r" % received)
+    if stop(True) != "block":
+        found.append("ping: a later hand-back did not ask again")
+    transcript.write_text("")
+    if stop(True) != "allow" or len(received) != 1:
+        found.append("ping: an empty report was sent, or the stop was held")
+    (ping / "webhook_url").unlink()
+    if stop(False) != "allow":
+        found.append("ping: without Slack Ping set up, the stop was held")
+    server.shutdown()
+    shutil.rmtree(sandbox, ignore_errors=True)
+    return found
+
+
 def main():
     failures, ran = [], 0
     sandbox = Path(tempfile.mkdtemp(prefix="away-policy-"))
@@ -464,7 +531,8 @@ def main():
 
     failures += cli_cases(tree)
     failures += resilience_cases(tree)
-    ran += 7
+    failures += ping_cases(tree)
+    ran += 14
     drift_failures, drift_ran = deletion_hint_drift_cases(tree)
     failures += drift_failures
     ran += drift_ran
