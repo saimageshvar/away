@@ -125,7 +125,7 @@ OUTWARD = [
 # Matched against a parsed git subcommand, so `git -C /path push` cannot slip by
 # on adjacency the way a plain regex allowed.
 GIT_OUTWARD = {
-    "push": "git push is never yours while away. Commit the work and leave it unpushed.",
+    "push": "git push to a protected branch is never yours while away. Commit and leave it.",
     "remote": "Remote surgery needs the operator.",
 }
 
@@ -208,6 +208,8 @@ FM_GIT_LOCAL = {
     "merge-base", "cat-file", "worktree", "bisect", "grep", "shortlog", "apply",
     "cherry-pick", "rebase", "reset", "clean", "rm", "mv", "tag", "notes", "config",
     "for-each-ref", "symbolic-ref", "update-index", "init",
+    # Safe only because push_is_unprotected() ran first and denied protected targets.
+    "push",
 }
 
 # git config reads are fine; a write is not. An alias is the sharpest case:
@@ -568,6 +570,16 @@ def gh_outward(group, verb, args):
         return None
     return ("gh %s %s writes to GitHub, and that needs the operator."
             % (group, verb or ""))
+
+
+def push_is_unprotected(cmd, hook):
+    """True only when push_guard clears every push in cmd; any failure keeps the deny."""
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from push_guard import check
+        return check(cmd, hook.get("cwd") or os.getcwd()) is None
+    except Exception:
+        return False
 
 
 def fm_provably_local(cmd):
@@ -1545,6 +1557,8 @@ def handle_pretooluse(hook):
                                  "cannot be scoped.")
             return
         for sub, _args in gcalls:
+            if sub == "push" and push_is_unprotected(cmd, hook):
+                continue
             if sub in GIT_OUTWARD:
                 deny(hook, tool, outward_reason(GIT_OUTWARD[sub]))
                 return

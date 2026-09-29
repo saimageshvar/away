@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.6.0
+
+A push to a feature branch is no longer denied while away. Blocking every push stranded
+finished work on the Mac; the branches that matter are the shared ones.
+
+- **Protected branches stay denied**: `main`, `master`, `develop`, `staging`, resolved
+  from the refspec or, for a bare `git push`, the current branch and its push target.
+  `--all`, `--mirror` and deletes of a protected branch count as protected.
+- **Fails closed.** `hooks/push_guard.py` decides; if it cannot load, or cannot tell
+  which branch a push updates, the old deny stands.
+- `push_guard.py` also runs standalone as a PreToolUse hook, to hold the same line
+  when away mode is off.
+
 ## 1.5.0
 
 The hand-back now reaches the operator's phone. With a Slack Ping workflow configured

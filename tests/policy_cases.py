@@ -107,7 +107,8 @@ CASES = [
     ("/tmp itself", "rm -rf /tmp", DENY, True),
 
     # --- outward
-    ("git push", "git push origin HEAD", DENY, True),
+    ("git push protected", "git push origin HEAD:main", DENY, True),
+    ("git push feature branch", "git push -f origin HEAD:feature/x", DEFER, True),
     ("git config alias", "git config alias.nuke '!rm -rf /'", DENY, True),
     ("git config read", "git config --get user.email", DEFER, True),
     ("gh pr create", "gh pr create --fill", DENY, True),
@@ -406,7 +407,7 @@ def resilience_cases(tree):
     proc = probe("make help")
     if proc.returncode != 0:
         found.append("a broken guard blocked an ordinary command despite the fallback")
-    proc = probe("git push origin HEAD")
+    proc = probe("git push origin HEAD:main")
     if "deny" not in proc.stdout:
         found.append("the fallback ran but stopped enforcing policy")
     if "guard.py is broken" not in proc.stderr:
