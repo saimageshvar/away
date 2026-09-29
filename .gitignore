@@ -6,3 +6,4 @@ dist/
 *.away-backup
 *.away-tmp
 .DS_Store
+__pycache__/
