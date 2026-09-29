@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.6.1
+
+1.6.0 let a push through whenever push_guard failed to *see* it, and away mode read
+that silence as clear. `FOO=1 git push origin master`, `timeout 60 git push …`,
+`{ git push …; }`, `git --git-dir .git push …`, a glob refspec, and any command shlex
+could not parse all reached a protected branch while away.
+
+- **Positive proof.** push_guard now answers allow only when every push is a plain
+  `git push` with literal, non-glob branch targets. Anything else it cannot read is an
+  ask, and away mode denies it: `xargs`, `$(…)`, `$VAR`, `~`/`^`/`@{u}`, `git subtree
+  push`, `-c push.*|remote.*|branch.*|core.hooksPath`, `push.default=matching` or a
+  `remote.*.push` refspec, and a parse failure.
+- **Reads what bash runs.** Env assignments, `command`/`env`/`time`/`nohup`/`timeout`
+  and other prefixes, `{ }`/`if`/`!`, glued redirects, spaced global git options, and
+  heredoc bodies fed to a shell.
+- **Away denies on disagreement.** A push guard.py's parser sees but push_guard does
+  not is denied, and the push check runs before `git_calls`, whose parse failure defers.
+- `echo "git push origin master"` is no longer denied: only `sh -c` and `eval`
+  payloads are read as commands.
+
 ## 1.6.0
 
 A push to a feature branch is no longer denied while away. Blocking every push stranded

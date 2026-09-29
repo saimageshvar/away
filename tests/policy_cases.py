@@ -109,6 +109,15 @@ CASES = [
     # --- outward
     ("git push protected", "git push origin HEAD:main", DENY, True),
     ("git push feature branch", "git push -f origin HEAD:feature/x", DEFER, True),
+    ("feature push behind an env prefix", "FOO=1 git push origin HEAD:feature/x", DEFER, True),
+    # Each of these once read as "no push" to push_guard, and that meant clear.
+    ("push behind an env prefix", "FOO=1 git push origin HEAD:main", DENY, True),
+    ("push behind timeout", "timeout 60 git push origin HEAD:main", DENY, True),
+    ("push with a spaced --git-dir", "git --git-dir .git push origin HEAD:main", DENY, True),
+    ("push in a brace group", "{ git push origin HEAD:main; }", DENY, True),
+    ("push fed by xargs", "echo main | xargs git push origin", DENY, True),
+    ("push glob refspec", "git push origin 'refs/heads/*:refs/heads/*'", DENY, True),
+    ("push shlex cannot parse", "git push origin HEAD:x; echo $'it\\'s'", DENY, True),
     ("git config alias", "git config alias.nuke '!rm -rf /'", DENY, True),
     ("git config read", "git config --get user.email", DEFER, True),
     ("gh pr create", "gh pr create --fill", DENY, True),

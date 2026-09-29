@@ -208,7 +208,7 @@ FM_GIT_LOCAL = {
     "merge-base", "cat-file", "worktree", "bisect", "grep", "shortlog", "apply",
     "cherry-pick", "rebase", "reset", "clean", "rm", "mv", "tag", "notes", "config",
     "for-each-ref", "symbolic-ref", "update-index", "init",
-    # Safe only because push_is_unprotected() ran first and denied protected targets.
+    # Safe only because push_verdict() ran first and denied protected targets.
     "push",
 }
 
@@ -572,14 +572,16 @@ def gh_outward(group, verb, args):
             % (group, verb or ""))
 
 
-def push_is_unprotected(cmd, hook):
-    """True only when push_guard clears every push in cmd; any failure keeps the deny."""
+def push_verdict(cmd, hook):
+    """push_guard's (decision, reason), or None when it finds no push. Failing to run is a deny."""
+    if not re.search(r"\bpush\b", cmd):
+        return None
     try:
         sys.path.insert(0, str(Path(__file__).resolve().parent))
         from push_guard import check
-        return check(cmd, hook.get("cwd") or os.getcwd()) is None
+        return check(cmd, hook.get("cwd") or os.getcwd())
     except Exception:
-        return False
+        return "deny", "the push guard could not run."
 
 
 def fm_provably_local(cmd):
@@ -1550,6 +1552,12 @@ def handle_pretooluse(hook):
             if re.search(pattern, cmd):
                 deny(hook, tool, outward_reason(why))
                 return
+        # Before git_calls, whose parse failure defers: a push must never ride on that.
+        pushv = push_verdict(cmd, hook)
+        if pushv and pushv[0] != "allow":
+            deny(hook, tool, outward_reason(GIT_OUTWARD["push"] if pushv[0] == "deny"
+                                            else pushv[1] + ", so it needs the operator."))
+            return
         gcalls = git_calls(cmd)
         if gcalls is None:
             if deletes:
@@ -1557,7 +1565,8 @@ def handle_pretooluse(hook):
                                  "cannot be scoped.")
             return
         for sub, _args in gcalls:
-            if sub == "push" and push_is_unprotected(cmd, hook):
+            # A push guard.py sees but push_guard does not is a parser disagreement: deny.
+            if sub == "push" and pushv and pushv[0] == "allow":
                 continue
             if sub in GIT_OUTWARD:
                 deny(hook, tool, outward_reason(GIT_OUTWARD[sub]))
