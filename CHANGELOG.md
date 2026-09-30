@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.7.0
+
+Deletes stop asking whenever git or scratch can undo them, away or not.
+
+- **Feature-branch checkouts.** A delete anywhere in a checkout whose branch is outside
+  `main`/`master`/`develop`/`staging` is allowed, recursive included, from any cwd —
+  sibling worktrees too. Dirty, untracked and ignored files under the target are
+  snapshotted first; over the 50MB cap it still asks. The checkout root and `.git` stay
+  off limits.
+- **Scratch.** Anything under `/tmp` or `$TMPDIR` is allowed, globs and checkouts included.
+- **Globs are expanded**, dotfiles included, and every match judged. Braces, zsh
+  qualifiers and `=cmd` still cannot be scoped.
+- **Containers.** `docker compose exec` / `docker exec` deletes map through bind mounts
+  to host paths and meet the host rules; with away off they no longer always ask.
+- **Holes closed.** `docker compose exec … && rm -rf ~/x` ran the host rm unjudged;
+  `git reset --hard && rm -rf ~/x` skipped the rm; `rm -rf src && cd /tmp` judged src
+  against /tmp.
+
 ## 1.6.1
 
 1.6.0 let a push through whenever push_guard failed to *see* it, and away mode read

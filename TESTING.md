@@ -112,12 +112,15 @@ Away ON:
 | `rm <tracked clean file>` | allow, no snapshot |
 | `rm <untracked or dirty file>` | snapshot, then allow |
 | `rm -rf node_modules` and other regenerable paths | allow |
-| `rm -rf <source dir>` | deny |
-| `rm` outside the working tree | deny |
-| `rm` under `/tmp` or `$TMPDIR` | allow, best-effort snapshot |
+| `rm -rf <anything>` in a checkout on a non-protected branch, from any cwd | snapshot what git cannot restore, then allow |
+| `rm -rf <checkout root>`, `rm -rf .git`, `rm -rf *` at a checkout root | deny |
+| `rm -rf <source dir>` on `main`/`master`/`develop`/`staging` | deny |
+| `rm` outside the working tree, not in a feature-branch checkout | deny |
+| `rm` under `/tmp` or `$TMPDIR`, globs and checkouts included | allow, best-effort snapshot |
 | `rm -rf /tmp` itself | deny |
 | `rm -rf ~/anything` | deny. The shell expands `~`, so the guard does too |
-| `rm` with a glob or a variable | deny |
+| `rm src/*.rb` | each match judged |
+| `rm` with a variable, braces, or a zsh qualifier | deny |
 | `docker run --rm`, `cat rm-notes.txt`, `echo "use rm"` | untouched. Naming rm is not running it |
 | `grep -n rm <file>` | untouched, and no snapshot is taken |
 | `FOO=1 rm …`, `timeout 5 rm …`, `for f in …; do rm …; done` | judged as the delete it is |
@@ -127,7 +130,11 @@ Away ON:
 | `cd <inside tree> && rm <path>` | scoped against the cd target |
 | `cd <outside tree> && rm <path>` | deny |
 | `docker compose exec … sh -lc "rm -rf node_modules"` | allow, regenerable target |
-| `docker compose exec … sh -lc "rm -rf /app/src"` | deny |
+| `docker compose exec … rm -rf <bind-mounted path>` | judged as the host path |
+| `docker compose exec … sh -lc "rm -rf /var/lib/mysql"` (container only) | deny |
+| `docker compose exec … && rm -rf ~/x` | deny. The second rm runs on the host |
+| `rm -rf src && cd /tmp` | judged against cwd. A late cd moves nothing |
+| `git reset --hard && rm -rf ~/x` | deny. The delete is judged before the git op |
 | `git reset --hard`, `git restore`, `git checkout .`, `git clean -fd` | undo bundle, then allow |
 | `away on`, `away off` | deny. Only the operator toggles the global flag |
 | `away on --here`, `away off --here` | allow. A session may scope itself |
@@ -135,7 +142,8 @@ Away ON:
 | `Edit`/`Write` on `~/.claude/away/**` or `settings.json` | deny |
 | `away report`, `away status`, `away trash`, `away decision` | allow |
 
-Away OFF: a real delete returns `ask`. A command that merely names one is untouched.
+Away OFF: the same delete rules, but a failure is `ask`, not deny. A command that
+merely names a delete is untouched.
 
 ## Scope
 

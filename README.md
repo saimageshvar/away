@@ -34,11 +34,24 @@ When away mode is on, four hooks change how an agent behaves:
   member ID in `~/.config/slack-ping/user_id`. The workflow takes
   `{"message", "userId"}`.
 
-**With away mode off**, one rule remains: a delete scoped to the working tree runs
-without asking — snapshotted first if git cannot bring it back — and anything the
-guard cannot scope still asks: `rm -rf src`, a path outside the tree, a variable or
-glob target, a delete behind `xargs`, `find` or a shell payload, or a container
-exec. Snapshots are pruned after 14 days.
+**Deletes follow one rule, away or not** — only a failure differs, a denial while
+away and an ask otherwise:
+
+- **In any git checkout on a branch outside `main`, `master`, `develop` and
+  `staging`**, any delete runs, recursive included, from any cwd. Git restores what is
+  committed; dirty, untracked and ignored files under the target are snapshotted first
+  (an ignored *directory* best-effort). The checkout root and its `.git` are never
+  deletable.
+- **Under `/tmp` or `$TMPDIR`**, anything runs, a checkout included.
+- **Elsewhere** — a protected branch, or no checkout — the older rule holds: in the
+  working tree only, recursive only on regenerable paths.
+- Globs are expanded and each match judged, dotfiles included. Variables, braces,
+  zsh qualifiers, `xargs`, `find -delete` and shell payloads still cannot be scoped.
+- `docker compose exec` / `docker exec` deletes map through the container's bind
+  mounts to host paths and meet the same rules; a path only in the container (its own
+  layer, a named volume) must be regenerable by name.
+
+Snapshots are pruned after 14 days.
 
 The rules the agents follow are in [`rules.md`](rules.md). The hooks inject them,
 so they reach every repo and every subagent without you restating anything.

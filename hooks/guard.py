@@ -7,7 +7,9 @@ a noisy failure can never corrupt a decision.
 """
 
 import fcntl
+import glob
 import json
+import posixpath
 import os
 import re
 import shlex
@@ -244,6 +246,11 @@ GH_OPTS_WITH_ARG = {"-R", "--repo", "--hostname", "--template", "--jq", "-q"}
 
 # A path we cannot resolve statically is a path we must not delete.
 UNRESOLVABLE = re.compile(r"[*?\[\]]|\$\(|\$\{|\$[A-Za-z_]|`")
+
+# Globs are expanded here; these are not. Braces, zsh qualifiers `*(.)`, numeric
+# ranges `<1-9>` and `=cmd` all reach paths no literal reading of the token names.
+UNEXPANDABLE = re.compile(r"\$\(|\$\{|\$[A-Za-z_]|`|[{}()<>]|^=")
+GLOB_CHARS = re.compile(r"[*?\[]")
 
 SEPARATORS = {"&&", "||", ";", "|", "&"}
 
@@ -686,6 +693,9 @@ def relax_base(cmd, cwd):
         return cwd, None
     if len(cds) > 1:
         return None, "the command changes directory more than once"
+    # `rm -rf foo && cd /tmp` deletes foo from cwd, so a late cd moves nothing.
+    if not re.match(r"\s*cd\s", cmd):
+        return None, "the command changes directory after it starts"
     target = cds[0].strip("'\"")
     if UNRESOLVABLE.search(target) or target == "-":
         return None, "the cd target cannot be resolved"
@@ -900,9 +910,11 @@ def under_scratch(target):
 
 
 def classify_static(raw, cwd):
-    """Classify what needs no git query. None means "ask git about this one"."""
-    if UNRESOLVABLE.search(raw):
-        return "unresolvable", None
+    """Classify what needs no git query. None means "ask git about this one".
+
+    `raw` has already been through expand_target, so any glob character left in
+    it is part of a real filename.
+    """
     # The shell expands ~ before rm ever sees it. Resolving the literal against
     # cwd made ~/logs read as an in-tree path and allowed a delete in $HOME.
     raw = os.path.expanduser(raw)
@@ -965,6 +977,83 @@ def git_ignored(target, cwd):
     Being git-ignored is the repo's own statement that a path is derived.
     """
     return run(["git", "check-ignore", "-q", "--", str(target)], cwd=cwd)[0] == 0
+
+
+def expand_target(raw, base):
+    """Every path a target token can reach, or None when that is unknowable.
+
+    Over-approximates on purpose: hidden files are included because GLOB_DOTS
+    makes `*` match `.git`, and the literal is kept because a quoted `[id].tsx`
+    is a filename, not a pattern. Judging a path rm will not touch costs a
+    snapshot at worst; missing one it will touch costs the file.
+    """
+    if UNEXPANDABLE.search(raw):
+        return None
+    raw = os.path.expanduser(raw)
+    if raw.startswith("~"):
+        return None
+    if not GLOB_CHARS.search(raw):
+        return [raw]
+    pattern = os.path.join(base, raw)
+    try:
+        found = glob.glob(pattern, recursive=True, include_hidden=True)
+    except TypeError:
+        return None                     # python < 3.11 cannot see dotfiles
+    return found + ([pattern] if os.path.lexists(pattern) else [])
+
+
+def _protected_branches():
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from push_guard import PROTECTED
+        return PROTECTED
+    except Exception:
+        return None
+
+
+def restorable_root(target):
+    """The checkout root when git can bring target back, else None.
+
+    That needs a commit to restore from and a branch outside push_guard's
+    PROTECTED list. Detached HEAD qualifies: the commit still holds every file.
+    """
+    probe = target if target.is_dir() and not target.is_symlink() else target.parent
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    root, branch = git_info(str(probe))
+    protected = _protected_branches()
+    if not root or protected is None or branch in protected:
+        return None
+    return Path(root)
+
+
+def unrestorable(root, targets):
+    """(required, best_effort) paths under targets that git cannot restore.
+
+    Dirty and untracked files must be snapshotted. An ignored DIRECTORY is build
+    output far more often than not, so it is best-effort; an ignored FILE is as
+    likely to be `.env` or `master.key`, so it is required. Returns None when git
+    cannot answer, and an unanswered question is never a pass.
+    """
+    git = ["git", "--literal-pathspecs", "-C", str(root)]
+    spec = ["--"] + [str(t) for t in targets]
+    lists = []
+    for args in (["diff", "--name-only", "-z", "HEAD"],
+                 ["ls-files", "-z", "-o", "--exclude-standard"],
+                 ["ls-files", "-z", "-o", "-i", "--exclude-standard", "--directory"]):
+        rc, out, _ = run(git + args + spec, timeout=30)
+        if rc != 0:
+            return None
+        lists.append([root / p.rstrip("/") for p in
+                      out.decode("utf-8", "surrogateescape").split("\0") if p])
+    dirty, untracked, ignored = lists
+    required = [p for p in dirty + untracked if os.path.lexists(p)]
+    best_effort = []
+    for path in ignored:
+        if set(path.relative_to(root).parts) & EPHEMERAL:
+            continue                    # ignored AND named like output: derived
+        (best_effort if path.is_dir() else required).append(path)
+    return required, best_effort
 
 
 def size_within(path, cap):
@@ -1255,23 +1344,79 @@ def away_toggle_scope(cmd):
     return "here" if found else None
 
 
-def container_inner(cmd):
-    """The inner shell script of a container exec, or None if this is not one."""
-    if not CONTAINER_EXEC.match(cmd):
+EXEC_OPTS_WITH_ARG = {"-u", "--user", "-e", "--env", "--env-file", "--index"}
+
+
+def container_exec(cmd):
+    """{"compose", "name", "workdir", "inner"} for one container exec, else None.
+
+    Only a single-segment command qualifies: in `docker compose exec … && rm -rf
+    ~/x` the second rm runs on the HOST, and treating the whole line as a
+    container exec once let it through unjudged.
+    """
+    if not CONTAINER_EXEC.match(cmd) or not single_segment(cmd):
         return None
     try:
         toks = shlex.split(cmd)
+        i = toks.index("exec") + 1
     except ValueError:
         return None
-    for index, tok in enumerate(toks):
-        if tok.rsplit("/", 1)[-1] not in ("sh", "bash", "zsh", "dash"):
-            continue
-        j = index + 1
-        while j < len(toks) and toks[j].startswith("-"):
-            if "c" in toks[j]:
-                return toks[j + 1] if j + 1 < len(toks) else None
-            j += 1
+    info = {"compose": toks[0] == "docker-compose" or toks[1] == "compose",
+            "docker": toks[0] in ("docker", "docker-compose"), "workdir": None}
+    while i < len(toks) and toks[i].startswith("-"):
+        opt = toks[i]
+        if opt in ("-w", "--workdir") and i + 1 < len(toks):
+            info["workdir"] = toks[i + 1]
+            i += 1
+        elif opt.startswith("--workdir="):
+            info["workdir"] = opt.split("=", 1)[1]
+        elif opt in EXEC_OPTS_WITH_ARG:
+            i += 1
+        i += 1
+    if i + 1 >= len(toks):
         return None
+    info["name"], rest = toks[i], toks[i + 1:]
+    payloads = shell_payloads(rest)
+    if rest[0].rsplit("/", 1)[-1] in SHELLS:
+        if not payloads:
+            return None
+        info["inner"] = payloads[0]
+    else:
+        info["inner"] = shlex.join(rest)
+    return info
+
+
+def container_mounts(info, cwd):
+    """([(dest, source, type)] longest dest first, workdir), or None."""
+    if not info["docker"]:
+        return None                     # kubectl and podman: no host to map to
+    cid = info["name"]
+    if info["compose"]:
+        rc, out, _ = run(["docker", "compose", "ps", "-q", cid], cwd=cwd, timeout=20)
+        cid = out.decode().strip().splitlines()[0] if rc == 0 and out.strip() else ""
+        if not cid:
+            return None
+    rc, out, _ = run(["docker", "inspect", "-f",
+                      "{{json .Mounts}}\t{{.Config.WorkingDir}}", cid], timeout=20)
+    if rc != 0:
+        return None
+    try:
+        raw, workdir = out.decode().strip().split("\t", 1)
+        mounts = [(m["Destination"].rstrip("/") or "/", m.get("Source") or "",
+                   m.get("Type")) for m in json.loads(raw)]
+    except Exception:
+        return None
+    return sorted(mounts, key=lambda m: -len(m[0])), workdir or "/"
+
+
+def container_to_host(path, mounts):
+    """The host path behind a container path, None when it lives only in the
+    container (its own layer, or a named volume)."""
+    for dest, source, kind in mounts:
+        if path == dest or path.startswith(dest.rstrip("/") + "/"):
+            if kind != "bind" or not source:
+                return None
+            return source + path[len(dest):]
     return None
 
 
@@ -1357,38 +1502,71 @@ def deny(hook, tool, reason, event="deferred", detail=None):
                  % (reason, note_suffix(hook.get("session_id"))))
 
 
-def handle_container_delete(hook, cmd, inner):
-    """A delete inside a container. Host containment cannot be checked, so only
-    regenerable targets pass: a bind mount can still reach host files."""
+def handle_container_delete(hook, cmd, info, armed=True):
+    """A delete inside a container, judged on the host through its bind mounts.
+
+    A bind-mounted target is a host path and meets every host rule. One that
+    lives only in the container -- its own layer or a named volume, where a
+    database keeps its data -- still has to be regenerable by name.
+    """
+    inner = info["inner"]
     icalls = rm_invocations(inner)
-    ok = bool(icalls) and all(paths for _flags, paths in icalls) and all(
-        set(Path(p).parts) & EPHEMERAL
-        for _flags, paths in icalls for p in paths)
-    if not ok:
-        deny(hook, "Bash",
-             "this deletes inside a container, where the host working tree cannot "
-             "be checked, and not every target is regenerable. Only paths such as "
-             "node_modules, dist, or tmp are allowed through a container exec.",
-             detail={"command": cmd, "inner": inner})
-        return
-    ctx = session_ctx(hook)
-    rec = {"ts": now_iso(), "event": "container_delete_allowed", "tool": "Bash",
-           "tool_use_id": hook.get("tool_use_id"),
-           "detail": {"command": cmd, "inner": inner},
-           "rule": "away: container delete targets only regenerable paths"}
-    rec.update(ctx)
-    log_event(rec)
-    # defer, so the rest of the command still meets the normal permission rules
+    blocker = unscopable(inner, icalls)
+    cds = re.findall(r"(?:^|[\s;&|])cd\s+([^\s;&|]+)", inner)
+    if not blocker and (len(cds) > 1 or (cds and not re.match(r"\s*cd\s", inner))):
+        blocker = "the container script changes directory more than once, or late."
+    if blocker:
+        refuse(hook, "inside the container, %s" % blocker, armed,
+               detail={"command": cmd, "inner": inner})
+        return False
+    mapped = container_mounts(info, hook.get("cwd") or os.getcwd())
+    mounts, workdir = mapped or ([], "/")
+    base = posixpath.join(workdir, info["workdir"] or "")
+    if cds:
+        base = posixpath.join(base, cds[0].strip("'\""))
+    host_calls = []
+    for flags, paths in icalls:
+        host = []
+        for raw in paths:
+            if UNEXPANDABLE.search(raw) or raw.startswith("~") \
+                    or UNEXPANDABLE.search(base) or base.startswith("~"):
+                refuse(hook, "a container target (%s) cannot be resolved." % raw, armed,
+                       detail={"command": cmd, "inner": inner})
+                return False
+            path = posixpath.normpath(posixpath.join(base, raw))
+            on_host = container_to_host(path, mounts)
+            if on_host is not None:
+                host.append(on_host)
+            elif not set(Path(path).parts) & EPHEMERAL:
+                refuse(hook, "%s lives only inside the container, where nothing can "
+                             "restore it, and is not regenerable output such as "
+                             "node_modules or tmp." % path, armed,
+                       detail={"command": cmd, "inner": inner})
+                return False
+        if host:
+            host_calls.append((flags, host))
+    # Never an explicit allow: the container script may run more than this delete.
+    if host_calls:
+        return handle_rm(hook, cmd, host_calls, armed=armed, explicit=False)
+    return True
 
 
-def handle_rm(hook, cmd, calls, base=None, armed=True):
-    """Judge a fully scoped delete.
+def refuse(hook, reason, armed, detail=None):
+    """While away a failure is a logged denial, because nobody is there to answer.
+    With the operator at the keyboard it is an unlogged `ask`, so the event log
+    stays a record of absences rather than of ordinary work."""
+    if armed:
+        deny(hook, "Bash", reason, detail=detail)
+    else:
+        emit_pretool("ask", "This delete needs you: %s" % reason)
 
-    `armed` decides only what happens when it does NOT pass. While away, a
-    failure is a denial and is logged, because nobody is there to answer. With
-    the operator at the keyboard it is an `ask`, which is what they would have
-    got anyway -- and nothing is logged, so the event log stays a record of
-    absences rather than of ordinary work.
+
+def handle_rm(hook, cmd, calls, base=None, armed=True, explicit=True):
+    """Judge a fully scoped delete. True when it passes.
+
+    `armed` decides only what happens when it does NOT pass. `explicit=False`
+    turns a pass into a silent defer, for a caller whose command runs more than
+    the delete this judged.
     """
     ctx = session_ctx(hook)
     if base:
@@ -1396,31 +1574,66 @@ def handle_rm(hook, cmd, calls, base=None, armed=True):
         ctx = dict(ctx, cwd=base)
 
     def block(reason, detail=None):
-        if armed:
-            deny(hook, "Bash", reason, detail=detail)
-        else:
-            emit_pretool("ask", "This delete needs you: %s" % reason)
+        refuse(hook, reason, armed, detail=detail)
 
-    # Pass 1: everything decidable without git, so a blocker short-circuits
-    # before any subprocess runs.
-    staged, blockers = [], {
-        "unresolvable": "a target uses a glob or a variable, so it cannot be scoped",
+    # Pass 1: everything decidable without git history, so a blocker
+    # short-circuits before the expensive queries run.
+    staged, in_repo, blockers = [], {}, {
+        "unresolvable": "a target uses a variable, a substitution or an expansion "
+                        "the guard cannot list, so it cannot be scoped",
         "outside": "a target sits outside the working tree",
         "git-internal": "a target is inside .git",
+        "checkout": "a target is a checkout itself, or inside its .git",
     }
     for flags, paths in calls:
         recursive = is_recursive(flags)
-        for raw in paths:
-            kind, target = classify_static(raw, ctx["cwd"])
-            if kind in blockers:
-                block("%s (%s). Delete only resolvable paths inside the working tree."
-                      % (blockers[kind], raw),
-                      detail={"command": cmd, "target": raw, "class": kind})
-                return
-            staged.append((raw, kind, target, recursive))
+        for token in paths:
+            expanded = expand_target(token, ctx["cwd"])
+            if expanded is None:
+                expanded = [None]
+            for raw in expanded:
+                if raw is None:
+                    kind, target = "unresolvable", None
+                else:
+                    kind, target = classify_static(raw, ctx["cwd"])
+                # Scratch is regenerable whatever it holds, a checkout included.
+                root = (target and kind not in ("unresolvable", "scratch")
+                        and restorable_root(target))
+                if root:
+                    rel = target.relative_to(root).parts
+                    if rel and ".git" not in rel:
+                        in_repo.setdefault(root, []).append((raw, target))
+                        continue
+                    kind = "checkout"
+                if kind in blockers:
+                    block("%s (%s). Delete only resolvable paths inside a git checkout "
+                          "on a feature branch, the working tree, or /tmp."
+                          % (blockers[kind], raw or token),
+                          detail={"command": cmd, "target": raw or token, "class": kind})
+                    return False
+                staged.append((raw, kind, target, recursive))
 
     # Pass 2: only the paths that still need git pay for it.
     verdicts, to_snapshot, optional, bad_recursive = [], [], [], None
+    # A feature-branch checkout can restore anything committed, whatever the
+    # recursion, so only what it cannot restore needs saving first.
+    for root, entries in in_repo.items():
+        found = unrestorable(root, [t for _r, t in entries])
+        if found is None:
+            block("git could not list what %s would lose." % root,
+                  detail={"command": cmd})
+            return False
+        required, best_effort = found
+        total = sum(size_within(p, MAX_SNAPSHOT_BYTES)[1] for p in required)
+        if total > MAX_SNAPSHOT_BYTES:
+            block("it would lose %dMB that git cannot restore, over the %dMB snapshot "
+                  "cap. Commit or stash it first."
+                  % (total // 1048576, MAX_SNAPSHOT_BYTES // 1048576),
+                  detail={"command": cmd})
+            return False
+        to_snapshot += required + best_effort
+        optional += best_effort
+        verdicts += [(r, "restorable", t) for r, t in entries]
     for raw, kind, target, recursive in staged:
         if (kind == "ephemeral" and not (set(target.parts) & ALWAYS_DERIVED)
                 and not git_ignored(target, ctx["cwd"])):
@@ -1442,10 +1655,8 @@ def handle_rm(hook, cmd, calls, base=None, armed=True):
               "one." % bad_recursive,
               detail={"command": cmd,
                       "verdicts": [[r, k] for r, k, _t in verdicts]})
-        return
-    if not verdicts:
-        block("a delete has no explicit target path.", detail={"command": cmd})
-        return
+        return False
+    # No verdicts at all means every glob matched nothing, so nothing is deleted.
 
     bundle = None
     if to_snapshot:
@@ -1453,7 +1664,7 @@ def handle_rm(hook, cmd, calls, base=None, armed=True):
         if err:
             block("the delete is unrecoverable and %s." % err,
                   detail={"command": cmd})
-            return
+            return False
     if armed:
         rec = {"ts": now_iso(), "event": "rm_allowed", "tool": "Bash",
                "tool_use_id": hook.get("tool_use_id"),
@@ -1465,15 +1676,13 @@ def handle_rm(hook, cmd, calls, base=None, armed=True):
         log_event(rec)
     # An explicit allow covers the WHOLE command, so a chain only ever defers to
     # the normal rules. rm is no longer in the ask list, so defer still runs it.
-    if not single_segment(cmd):
-        return
+    if not explicit or not single_segment(cmd):
+        return True
     note = " A snapshot is saved at %s." % bundle if bundle else ""
-    where = ("the working tree or a temp directory"
-             if any(k == "scratch" for _r, k, _t in verdicts)
-             else "the working tree")
-    emit_pretool("allow", "%sDelete allowed: every target is inside %s and "
-                          "recoverable.%s"
-                 % ("AWAY MODE. " if armed else "", where, note))
+    emit_pretool("allow", "%sDelete allowed: every target is recoverable from git, "
+                          "the snapshot, or is regenerable.%s"
+                 % ("AWAY MODE. " if armed else "", note))
+    return True
 
 
 def handle_git_destructive(hook, cmd):
@@ -1493,6 +1702,33 @@ def handle_git_destructive(hook, cmd):
         return
     emit_pretool("allow", "AWAY MODE. Allowed, and an undo bundle is saved at %s. "
                           "Recover it with `away trash`." % bundle)
+
+
+def judge_delete(hook, cmd, calls, armed):
+    """Scope and judge a delete-shaped command. True when it passes.
+
+    A pass may already have emitted an explicit allow; a failure has always
+    emitted its denial or ask.
+    """
+    info = container_exec(cmd)
+    if info is not None:
+        return handle_container_delete(hook, cmd, info, armed)
+    cwd = hook.get("cwd") or os.getcwd()
+    base, err = effective_base(cmd, cwd)
+    if err:
+        # A cd out of the session tree is fine so long as it lands somewhere we
+        # can characterise; handle_rm still applies every rule against it.
+        base, wider = relax_base(cmd, cwd)
+        if base is None:
+            refuse(hook, "%s Re-run it as an explicit `rm <path>`, or defer it."
+                   % (wider or err), armed)
+            return False
+    blocker = unscopable(cmd, calls)
+    if blocker:
+        refuse(hook, "%s Re-run it as an explicit `rm <path>`, or defer it." % blocker,
+               armed)
+        return False
+    return handle_rm(hook, cmd, calls, base, armed=armed)
 
 
 def handle_pretooluse(hook):
@@ -1527,23 +1763,10 @@ def handle_pretooluse(hook):
 
         if not on:
             # Away is OFF, so the only job left is the `ask` on deletes that this
-            # hook took over from the permission list. But asking about EVERY
-            # delete asks about the ones it can already prove are safe: a target
-            # inside the working tree, non-recursive or regenerable, snapshotted
-            # if git cannot bring it back. That is the same test handle_rm
-            # applies while armed, and passing it is the whole reason the answer
-            # would have been yes. So run it, and keep the prompt for the deletes
-            # that genuinely need a human.
-            if not (deletes or calls):
-                return
-            cwd_now = hook.get("cwd") or os.getcwd()
-            if calls and container_inner(cmd) is None:
-                base, err = effective_base(cmd, cwd_now)
-                if not err and not unscopable(cmd, calls):
-                    handle_rm(hook, cmd, calls, base, armed=False)
-                    return
-            emit_pretool("ask", "This deletes files and its targets cannot be scoped "
-                                "to the working tree, so it is your call.")
+            # hook took over from the permission list. The test is the one used
+            # while armed; only a failure differs, an ask instead of a denial.
+            if deletes or calls:
+                judge_delete(hook, cmd, calls, armed=False)
             return
 
         # Outward ops are checked first and across the whole command, so an rm
@@ -1595,39 +1818,15 @@ def handle_pretooluse(hook):
             return
 
         # Anything delete-shaped that we cannot fully resolve must die here. The
-        # fallthrough is `defer`, and Bash(*) turns defer into allow.
-        base = ctx_cwd = hook.get("cwd") or os.getcwd()
-        if deletes:
-            inner = container_inner(cmd)
-            if inner is not None:
-                handle_container_delete(hook, cmd, inner)
-                return
-            base, err = effective_base(cmd, ctx_cwd)
-            if err:
-                # A cd out of the session tree is fine so long as it lands
-                # somewhere we can characterise. handle_rm then applies every
-                # rule it always did -- containment, the recursion test, and a
-                # snapshot that must succeed -- against that base rather than
-                # against cwd. Nothing is relaxed except which tree counts.
-                base, wider = relax_base(cmd, ctx_cwd)
-                if base is None:
-                    deny(hook, tool, "%s Re-run it as an explicit `rm <path>` "
-                                     "inside the working tree, or defer it."
-                         % (wider or err))
-                    return
-            blocker = unscopable(cmd, calls)
-            if blocker:
-                deny(hook, tool, "%s Re-run it as an explicit `rm <path>` inside "
-                                 "the working tree, or defer it." % blocker)
-                return
-
+        # fallthrough is `defer`, and Bash(*) turns defer into allow. The delete is
+        # judged BEFORE any git op: `git reset --hard && rm -rf ~/x` used to take
+        # the git branch and defer, so the rm was never looked at.
+        if (deletes or calls) and not judge_delete(hook, cmd, calls, armed=True):
+            return
         for sub, args in gcalls:
             if git_destructive(sub, args):
                 handle_git_destructive(hook, cmd)
                 return
-        if calls:
-            handle_rm(hook, cmd, calls, base)
-            return
         return  # defer to the normal permission flow
 
     if not on:

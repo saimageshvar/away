@@ -180,6 +180,133 @@ CASES = [
 ]
 
 
+def git_repo(path, branch):
+    """A committed checkout on `branch`: src/a.rb tracked, src/new.rb untracked,
+    an ignored .env file and an ignored cache/ directory."""
+    subprocess.run(["git", "init", "-q", "-b", branch, str(path)], check=True)
+    (path / "src").mkdir()
+    (path / "src" / "a.rb").write_text("tracked\n")
+    (path / ".gitignore").write_text(".env\ncache/\n")
+    git = ["git", "-C", str(path), "-c", "user.name=t", "-c", "user.email=t@t"]
+    subprocess.run(git + ["add", "."], check=True)
+    subprocess.run(git + ["commit", "-qm", "init"], check=True)
+    (path / "src" / "new.rb").write_text("only copy\n")
+    (path / ".env").write_text("SECRET=1\n")
+    (path / "cache").mkdir()
+    (path / "cache" / "blob").write_text("derived\n")
+    return path
+
+
+def checkout_cases(sandbox, tree):
+    """A checkout on a feature branch can restore what it tracks, so only what it
+    cannot restore needs saving -- whatever the recursion, wherever it lives."""
+    # Not under $TMPDIR: scratch is deletable whatever it holds, which would mask
+    # every checkout rule under test.
+    cache = Path.home() / ".cache"
+    cache.mkdir(exist_ok=True)
+    root = Path(tempfile.mkdtemp(prefix="away-checkouts-", dir=cache)).resolve()
+    feat = git_repo(root / "feat", "feature/x")
+    main = git_repo(root / "main", "main")
+    scratch_repo = Path("/tmp/away-policy-scratch-repo")
+    shutil.rmtree(scratch_repo, ignore_errors=True)
+    git_repo(scratch_repo, "main")
+    for name in ("a", "b"):
+        (Path("/tmp/away-policy-scratch") / name).write_text("x\n")
+
+    # (label, command, cwd, expected armed, expected off)
+    cases = [
+        ("feature: recursive source dir", "rm -rf src", feat, ALLOW, ALLOW),
+        ("feature: from another tree", "rm -rf %s/src" % feat, tree, ALLOW, ALLOW),
+        ("feature: glob", "rm src/*.rb", feat, ALLOW, ALLOW),
+        ("feature: ignored secret", "rm .env", feat, ALLOW, ALLOW),
+        ("feature: glob matching nothing", "rm -f src/*.nope", feat, ALLOW, ALLOW),
+        ("feature: chain after a cd", "cd %s && rm -rf src" % feat, tree, DEFER, DEFER),
+        ("feature: the checkout itself", "rm -rf %s" % feat, tree, DENY, ASK),
+        ("feature: its .git", "rm -rf .git", feat, DENY, ASK),
+        ("feature: a glob that reaches .git", "rm -rf *", feat, DENY, ASK),
+        ("feature: brace expansion", "rm -rf src/{a,b}", feat, DENY, ASK),
+        ("feature: zsh glob qualifier", "rm -rf src/*(.)", feat, DENY, ASK),
+        ("feature: variable", "rm -rf $DIR/src", feat, DENY, ASK),
+        ("protected branch keeps the old rules", "rm -rf %s/src" % main, tree, DENY, ASK),
+        ("protected: in-tree recursive", "rm -rf src", main, DENY, ASK),
+        ("protected: in-tree file", "rm src/new.rb", main, ALLOW, ALLOW),
+        ("scratch: glob", "rm -rf /tmp/away-policy-scratch/*", tree, ALLOW, ALLOW),
+        ("scratch: a checkout under /tmp", "rm -rf %s" % scratch_repo, tree, ALLOW, ALLOW),
+        ("a late cd does not move the base", "rm -rf src && cd /tmp", tree, DENY, ASK),
+        ("git op first, delete second", "git reset --hard && rm -rf ~/away-x", tree,
+         DENY, ASK),
+        ("container chained to a host delete",
+         'docker compose exec web sh -lc "rm -rf node_modules" && rm -rf ~/away-x',
+         tree, DENY, ASK),
+    ]
+
+    # A docker stand-in: /app is feat bind-mounted, node_modules and mysql live
+    # only in the container.
+    shim = root / "bin"
+    shim.mkdir()
+    mounts = json.dumps([
+        {"Type": "bind", "Source": str(feat), "Destination": "/app"},
+        {"Type": "volume", "Source": "/var/lib/docker/v/nm",
+         "Destination": "/app/node_modules"},
+    ])
+    (shim / "docker").write_text(
+        "#!/bin/sh\ncase \"$*\" in\n"
+        "  'compose ps -q '*) echo cid123 ;;\n"
+        "  'inspect '*) printf '%%s\\t%%s\\n' '%s' /app ;;\n"
+        "  *) exit 1 ;;\nesac\n" % mounts)
+    (shim / "docker").chmod(0o755)
+    path_env = "%s:%s" % (shim, os.environ.get("PATH", ""))
+    container = [
+        ("container: bind-mounted source", 'docker compose exec app sh -lc "rm -rf src"',
+         DEFER, DEFER),
+        ("container: workdir flag", "docker compose exec -T -w /app/src app rm a.rb",
+         DEFER, DEFER),
+        ("container: volume, regenerable", "docker compose exec app rm -rf node_modules/x",
+         DEFER, DEFER),
+        ("container: bind-mounted .git", "docker compose exec app rm -rf /app/.git",
+         DENY, ASK),
+        ("container: container-only data",
+         'docker compose exec app sh -lc "rm -rf /var/lib/mysql"', DENY, ASK),
+    ]
+
+    found, ran = [], 0
+    for label, cmd, cwd, want_on, want_off in cases:
+        for armed, want in ((True, want_on), (False, want_off)):
+            ran += 1
+            got, proc = decide(sandbox, cmd, cwd, armed=armed)
+            if got != want:
+                found.append("%-40s %s want %-5s got %-5s  %s\n        %s"
+                             % (label, "on " if armed else "off", want, got, cmd,
+                                proc.stdout[:200]))
+    old_path = os.environ["PATH"]
+    os.environ["PATH"] = path_env
+    try:
+        for label, cmd, want_on, want_off in container:
+            for armed, want in ((True, want_on), (False, want_off)):
+                ran += 1
+                got, proc = decide(sandbox, cmd, tree, armed=armed)
+                if got != want:
+                    found.append("%-40s %s want %-5s got %-5s  %s\n        %s"
+                                 % (label, "on " if armed else "off", want, got, cmd,
+                                    proc.stdout[:200]))
+    finally:
+        os.environ["PATH"] = old_path
+
+    # What git cannot restore is saved; what it can is not.
+    saved = [str(p) for p in (sandbox / "state" / "trash").rglob("*") if p.is_file()]
+    ran += 1
+    if not any(p.endswith("feat/src/new.rb") for p in saved):
+        found.append("the untracked src/new.rb was not snapshotted")
+    if any(p.endswith("feat/src/a.rb") for p in saved):
+        found.append("the tracked src/a.rb was snapshotted, but git restores it")
+    if not any(p.endswith("feat/.env") for p in saved):
+        found.append("the ignored .env was not snapshotted")
+
+    shutil.rmtree(root, ignore_errors=True)
+    shutil.rmtree(scratch_repo, ignore_errors=True)
+    return found, ran
+
+
 def cli_cases(tree):
     """A session-scoped absence has to behave like a real one end to end.
 
@@ -539,6 +666,9 @@ def main():
         failures.append("grep -n rm README-away logged an rm_allowed event")
     ran += 1
 
+    checkout_failures, checkout_ran = checkout_cases(sandbox, tree)
+    failures += checkout_failures
+    ran += checkout_ran
     failures += cli_cases(tree)
     failures += resilience_cases(tree)
     failures += ping_cases(tree)
