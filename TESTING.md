@@ -48,7 +48,7 @@ print(json.dumps({"session_id":"test","cwd":os.environ["CWD"],
   | AWAY_TEST=1 bash "$G" pretooluse
 }
 away on "synthetic test"
-decide 'git push origin HEAD'      # expect deny
+decide 'git push origin HEAD:main' # expect ask
 decide 'rm -rf node_modules'       # expect allow
 away off
 ```
@@ -102,7 +102,8 @@ Away ON:
 | `AskUserQuestion` | deny, with the options and the recommended one named |
 | `ExitPlanMode` | allow, plan text logged |
 | `Read`, `Grep`, `Edit` on ordinary files | untouched |
-| `git push`, `git -C <path> push`, `git remote` | deny |
+| `git push` to `main`/`master`/`develop`/`staging` | ask (the prompt is then denied) |
+| `git push` it cannot read, `git remote` | deny |
 | any `git config` write, scoped or not (aliases included) | deny |
 | `git config --get`, `--list` | untouched |
 | `aws`, `terraform`, `sudo`, `npm publish` | deny |

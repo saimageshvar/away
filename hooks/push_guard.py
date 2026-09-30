@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PreToolUse(Bash): deny git push to protected branches; every other push goes through.
+"""PreToolUse(Bash): ask before git push to protected branches; every other push goes through.
 
 Allows only what it can prove. A push it cannot fully read (a wrapper it does not
 know, a variable, a glob, config that picks the target) is an ask, never a pass.
@@ -151,7 +151,7 @@ def check_push(seg, i, cwd):
         return UNKNOWN
     hit = sorted(targets & PROTECTED)
     if hit:
-        return "deny", f"git push to protected branch {', '.join(hit)} is blocked"
+        return "ask", f"git push to protected branch {', '.join(hit)} needs your approval"
     return "allow", "git push to an unprotected branch"
 
 

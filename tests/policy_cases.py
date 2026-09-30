@@ -107,14 +107,14 @@ CASES = [
     ("/tmp itself", "rm -rf /tmp", DENY, True),
 
     # --- outward
-    ("git push protected", "git push origin HEAD:main", DENY, True),
+    ("git push protected", "git push origin HEAD:main", ASK, True),
     ("git push feature branch", "git push -f origin HEAD:feature/x", DEFER, True),
     ("feature push behind an env prefix", "FOO=1 git push origin HEAD:feature/x", DEFER, True),
     # Each of these once read as "no push" to push_guard, and that meant clear.
-    ("push behind an env prefix", "FOO=1 git push origin HEAD:main", DENY, True),
-    ("push behind timeout", "timeout 60 git push origin HEAD:main", DENY, True),
-    ("push with a spaced --git-dir", "git --git-dir .git push origin HEAD:main", DENY, True),
-    ("push in a brace group", "{ git push origin HEAD:main; }", DENY, True),
+    ("push behind an env prefix", "FOO=1 git push origin HEAD:main", ASK, True),
+    ("push behind timeout", "timeout 60 git push origin HEAD:main", ASK, True),
+    ("push with a spaced --git-dir", "git --git-dir .git push origin HEAD:main", ASK, True),
+    ("push in a brace group", "{ git push origin HEAD:main; }", ASK, True),
     ("push fed by xargs", "echo main | xargs git push origin", DENY, True),
     ("push glob refspec", "git push origin 'refs/heads/*:refs/heads/*'", DENY, True),
     ("push shlex cannot parse", "git push origin HEAD:x; echo $'it\\'s'", DENY, True),
@@ -543,7 +543,7 @@ def resilience_cases(tree):
     proc = probe("make help")
     if proc.returncode != 0:
         found.append("a broken guard blocked an ordinary command despite the fallback")
-    proc = probe("git push origin HEAD:main")
+    proc = probe("gh pr create --fill")
     if "deny" not in proc.stdout:
         found.append("the fallback ran but stopped enforcing policy")
     if "guard.py is broken" not in proc.stderr:

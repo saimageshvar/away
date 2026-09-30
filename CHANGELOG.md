@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.8.0
+
+Protected-branch pushes ask instead of being refused, and hand-back pings get short.
+
+- **Push asks.** A push to `main`/`master`/`develop`/`staging` is an `ask`, not a `deny`,
+  from both push_guard and away mode. At the keyboard you approve it in the prompt; while
+  away the prompt is still auto-denied. Unreadable pushes keep their existing verdicts.
+- **Crisp Slack Ping.** The hand-back report is at most 5 lines: a status line, then one
+  bullet per blocker, deferred call or mistake. The fixed PROGRESS / BLOCKED / WHAT I GOT
+  WRONG sections are gone.
+
 ## 1.7.0
 
 Deletes stop asking whenever git or scratch can undo them, away or not.

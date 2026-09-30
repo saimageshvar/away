@@ -20,7 +20,8 @@ When away mode is on, four hooks change how an agent behaves:
 - **Plan approval is auto-approved.** No agent waits at a checkpoint.
 - **Outward actions are denied** — PR creation, anything that leaves the machine.
   `git push` is allowed only to a branch outside `main`, `master`, `develop` and
-  `staging` (`hooks/push_guard.py`); a push to one of those is left unpushed. A token list does
+  `staging` (`hooks/push_guard.py`); a push to one of those asks, and while away the
+  unanswerable prompt is denied, so it is left unpushed. A token list does
   the deciding; an on-device model reads whatever the list did not recognise
   (see [the model pass](#the-model-pass)).
 - **Unrecoverable deletes are snapshotted first**, into `away trash`, then allowed.

@@ -210,7 +210,7 @@ FM_GIT_LOCAL = {
     "merge-base", "cat-file", "worktree", "bisect", "grep", "shortlog", "apply",
     "cherry-pick", "rebase", "reset", "clean", "rm", "mv", "tag", "notes", "config",
     "for-each-ref", "symbolic-ref", "update-index", "init",
-    # Safe only because push_verdict() ran first and denied protected targets.
+    # Safe only because push_verdict() ran first and stopped protected targets.
     "push",
 }
 
@@ -1778,8 +1778,11 @@ def handle_pretooluse(hook):
         # Before git_calls, whose parse failure defers: a push must never ride on that.
         pushv = push_verdict(cmd, hook)
         if pushv and pushv[0] != "allow":
-            deny(hook, tool, outward_reason(GIT_OUTWARD["push"] if pushv[0] == "deny"
-                                            else pushv[1] + ", so it needs the operator."))
+            if pushv[1].startswith("git push to protected branch"):
+                emit_pretool("ask", "AWAY MODE. " + pushv[1])
+            else:
+                deny(hook, tool, outward_reason(GIT_OUTWARD["push"] if pushv[0] == "deny"
+                                                else pushv[1] + ", so it needs the operator."))
             return
         gcalls = git_calls(cmd)
         if gcalls is None:
@@ -2011,12 +2014,13 @@ def ping_on_stop(hook, session, last_stop):
             "hook sends that message to them as a Slack DM, so do not send it "
             "yourself.\n"
             "Plain text only: Slack formatting such as *bold*, backticks, > and "
-            "markdown headings shows literally. First line: ✅ done, ❌ failed or "
-            "⏸️ needs input, then the repo or task and the outcome. Then "
-            "UPPERCASE headings PROGRESS, BLOCKED and WHAT I GOT WRONG, each with "
-            "• bullets. Give every deferred item its evidence and your "
-            "recommendation. No secrets or customer data. Your next stop will be "
-            "accepted."),
+            "markdown headings shows literally. It is read on a phone, so keep it "
+            "crisp: at most 5 lines, no headings, no filler. Line 1: ✅ done, ❌ "
+            "failed or ⏸️ needs input, then the repo or task and the outcome in "
+            "one clause. Then only what the operator must know or act on, one • "
+            "bullet each: a blocker or deferred call with your recommendation, "
+            "or a mistake you made. Nothing to add means line 1 alone. No secrets "
+            "or customer data. Your next stop will be accepted."),
     }))
 
 
