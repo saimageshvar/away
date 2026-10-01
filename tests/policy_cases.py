@@ -555,6 +555,73 @@ def resilience_cases(tree):
     return found
 
 
+def permission_prompt_cases(tree):
+    """Every prompt while away is denied with a way forward, and never interrupts."""
+    sandbox = Path(tempfile.mkdtemp(prefix="away-prompt-"))
+    (sandbox / "state").mkdir(parents=True)
+    flag = sandbox / "state" / "active.json"
+    log = sandbox / "state" / "events.jsonl"
+
+    def ask(event, tool, tool_input, armed=True):
+        if armed:
+            flag.write_text('{"on":true,"since_epoch":1}')
+        elif flag.exists():
+            flag.unlink()
+        payload = {"session_id": "prompttest", "cwd": str(tree), "tool_name": tool,
+                   "tool_input": tool_input}
+        proc = subprocess.run(
+            [sys.executable, str(GUARD), event], input=json.dumps(payload),
+            capture_output=True, text=True, timeout=60,
+            env=dict(os.environ, AWAY_HOME=str(sandbox), AWAY_TEST="1"))
+        if not proc.stdout.strip():
+            return None
+        return json.loads(proc.stdout)["hookSpecificOutput"]["decision"]
+
+    cases = [
+        ("push", "git push -u origin x", "Keep committing locally"),
+        ("push after cd", "cd sub && git push", "Keep committing locally"),
+        ("push with git -C", "git -C repo push origin x", "Keep committing locally"),
+        ("delete with env prefix", "FOO=1 rm x", "not done:"),
+        ("rmdir", "rmdir d", "not done:"),
+        ("push beats delete", "rm x && git push", "Keep committing locally"),
+        ("anything else", "make deploy", "Route around it"),
+    ]
+    found = []
+    for label, cmd, want in cases:
+        log.unlink(missing_ok=True)
+        got = ask("permissionrequest", "Bash", {"command": cmd})
+        if not got or got.get("behavior") != "deny" or want not in got.get("message", ""):
+            found.append("prompt: %-24s want deny with %r, got %r" % (label, want, got))
+        elif "interrupt" in got:
+            found.append("prompt: %-24s set interrupt, which ends the turn" % label)
+    got = ask("permissionrequest", "WebFetch", {"url": "https://x.example"})
+    if not got or "Route around it" not in got.get("message", ""):
+        found.append("prompt: a non-Bash tool did not get the general message: %r" % got)
+    got = ask("permissionrequest", "ExitPlanMode", {"plan": "p"})
+    if not got or got.get("behavior") != "allow":
+        found.append("prompt: plan exit was not approved: %r" % got)
+
+    log.unlink(missing_ok=True)
+    if ask("permissiondenied", "Bash", {"command": "rm -rf /x"}) is not None:
+        found.append("permissiondenied: emitted output, which the harness ignores")
+    if [r.get("event") for r in events(sandbox)] != ["auto_denied"]:
+        found.append("permissiondenied: did not log auto_denied: %r" % events(sandbox))
+    ask("permissiondenied", "Bash", {"command": "rm -rf /y"})
+    got = ask("permissionrequest", "Bash", {"command": "make x"})
+    if "degraded" not in (got or {}).get("message", ""):
+        found.append("prompt: three quick blocks did not flag the session degraded")
+    log.unlink(missing_ok=True)
+    got = ask("permissionrequest", "Bash", {"command": "make x"})
+    if "degraded" in (got or {}).get("message", ""):
+        found.append("prompt: one block flagged the session degraded")
+
+    for event in ("permissionrequest", "permissiondenied"):
+        if ask(event, "Bash", {"command": "git push"}, armed=False) is not None:
+            found.append("%s: emitted output with away mode off" % event)
+    shutil.rmtree(sandbox, ignore_errors=True)
+    return found
+
+
 def ping_cases(tree):
     """The hand-back report: asked for once per stop, sent from the hook, never looped."""
     import http.server
@@ -672,7 +739,8 @@ def main():
     failures += cli_cases(tree)
     failures += resilience_cases(tree)
     failures += ping_cases(tree)
-    ran += 14
+    failures += permission_prompt_cases(tree)
+    ran += 29
     drift_failures, drift_ran = deletion_hint_drift_cases(tree)
     failures += drift_failures
     ran += drift_ran

@@ -479,12 +479,14 @@ def emit_pretool(decision, reason=None):
     print(json.dumps({"hookSpecificOutput": payload}))
 
 
-def emit_permreq(behavior):
-    # PermissionRequest documents only behavior and updatedInput, so no reason
-    # field is sent. PreToolUse carries every reason the agent needs to read.
+def emit_permreq(behavior, message=None):
+    # Never `interrupt`: it stops Claude, which would end the turn mid-absence.
+    decision = {"behavior": behavior}
+    if message:
+        decision["message"] = message
     print(json.dumps({"hookSpecificOutput": {
         "hookEventName": "PermissionRequest",
-        "decision": {"behavior": behavior},
+        "decision": decision,
     }}))
 
 
@@ -1859,29 +1861,110 @@ def handle_pretooluse(hook):
                               "is logged for review. Proceed.")
 
 
+DENY_MESSAGES = {
+    "push": "AWAY MODE. This push needs an approval nobody is here to give. Do not "
+            "retry it. Keep committing locally and carry on; the branch stays unpushed "
+            "for the operator.",
+    "delete": "AWAY MODE. This delete needs an approval nobody is here to give. Do not "
+              "retry it. Leave the files, record it with `%s decision \"not done: "
+              "<command> - <why>\"`, and carry on." % (AWAY / "bin" / "away"),
+    "other": "AWAY MODE. This needs an approval nobody is here to give. Do not retry "
+             "it. Route around it, or defer it with evidence, options and your "
+             "recommendation, and carry on with everything it does not block.",
+}
+DEGRADED = ("\nAuto mode has likely paused after repeated blocks, so this session is "
+            "degraded: land your work, record what is not done, and stop.")
+DENIAL_EVENTS = ("deferred", "auto_denied")
+DEGRADED_TOTAL = 20
+DEGRADED_BURST = 3
+DEGRADED_BURST_SECONDS = 120
+
+
+def denial_kind(cmd):
+    """push beats delete beats other, across every segment of the command."""
+    kinds = set()
+    for toks in segments(cmd) or []:
+        index = command_index(toks)
+        if index is None:
+            continue
+        word = toks[index].rsplit("/", 1)[-1].lower()
+        if word == "git":
+            j = index + 1
+            while j < len(toks) and toks[j].startswith("-"):
+                j += 2 if toks[j] in GIT_OPTS_WITH_ARG else 1
+            if j < len(toks) and toks[j] == "push":
+                kinds.add("push")
+        elif word in DELETE_BINS or word == "rmdir":
+            kinds.add("delete")
+    return next((k for k in ("push", "delete") if k in kinds), "other")
+
+
+def degraded(session):
+    """Auto mode pauses after 3 blocks in a row or 20 in total.
+
+    ponytail: away cannot see the calls that succeed between blocks, so "in a row"
+    is approximated as 3 blocks within two minutes.
+    """
+    since = scope_state(session).get("since_epoch") or 0
+    stamps = []
+    for line in tail_lines(EVENTS, 6000):
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue
+        if rec.get("session") != session or rec.get("event") not in DENIAL_EVENTS:
+            continue
+        if rec.get("synthetic") and not SYNTHETIC:
+            continue
+        try:
+            when = datetime.strptime(rec.get("ts", ""), "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=timezone.utc).timestamp()
+        except Exception:
+            continue
+        if when >= since:
+            stamps.append(when)
+    burst = stamps[-DEGRADED_BURST:]
+    return len(stamps) >= DEGRADED_TOTAL or (
+        len(burst) == DEGRADED_BURST and burst[-1] - burst[0] <= DEGRADED_BURST_SECONDS)
+
+
 def handle_permissionrequest(hook):
-    if not away_on(hook.get("session_id")):
+    session = hook.get("session_id")
+    if not away_on(session):
         return
     tool = hook.get("tool_name") or ""
+    tool_input = hook.get("tool_input") or {}
     ctx = session_ctx(hook)
     if tool == "ExitPlanMode":
         rec = {"ts": now_iso(), "event": "plan_self_approved", "tool": tool,
                "tool_use_id": hook.get("tool_use_id"),
-               "detail": {"plan": (hook.get("tool_input") or {}).get("plan")},
+               "detail": {"plan": tool_input.get("plan")},
                "rule": "away: plan approved for you"}
         rec.update(ctx)
         log_event(rec)
         emit_permreq("allow")
         return
-    # Anything still reaching a prompt would stall the whole absence, so it dies
-    # here rather than waiting for an operator who cannot answer.
+    # Nobody can answer a prompt, so it dies here with a way forward rather than
+    # stalling the absence.
+    kind = denial_kind(tool_input.get("command") or "") if tool == "Bash" else "other"
     rec = {"ts": now_iso(), "event": "deferred", "tool": tool,
-           "tool_use_id": hook.get("tool_use_id"),
-           "detail": hook.get("tool_input"),
-           "rule": "away: nothing can be approved"}
+           "tool_use_id": hook.get("tool_use_id"), "detail": tool_input,
+           "rule": "away: nothing can be approved (%s)" % kind}
     rec.update(ctx)
     log_event(rec)
-    emit_permreq("deny")
+    message = DENY_MESSAGES[kind] + (DEGRADED if degraded(session) else "")
+    emit_permreq("deny", message + note_suffix(session))
+
+
+def handle_permissiondenied(hook):
+    """Auto mode refused a call. Nothing can be said back to the model, so log it."""
+    if not away_on(hook.get("session_id")):
+        return
+    rec = {"ts": now_iso(), "event": "auto_denied", "tool": hook.get("tool_name"),
+           "tool_use_id": hook.get("tool_use_id"), "detail": hook.get("tool_input"),
+           "rule": "auto mode: denied"}
+    rec.update(session_ctx(hook))
+    log_event(rec)
 
 
 STOP_EVENTS = ("stop_blocked", "ping_requested", "ping_sent", "ping_failed",
@@ -1907,7 +1990,8 @@ def handle_stop(hook):
             continue
         if rec.get("session") != session:
             continue
-        if rec.get("event") in ("deferred", "deferred_by_model", "decision_forced"):
+        if rec.get("event") in ("deferred", "deferred_by_model", "decision_forced",
+                                "auto_denied"):
             denied = True
         if rec.get("event") == "stop_blocked":
             blocked = True
@@ -2020,7 +2104,8 @@ def ping_on_stop(hook, session, last_stop):
             "one clause. Then only what the operator must know or act on, one • "
             "bullet each: a blocker or deferred call with your recommendation, "
             "or a mistake you made. Nothing to add means line 1 alone. No secrets "
-            "or customer data. Your next stop will be accepted."),
+            "or customer data. Your next stop will be accepted."
+            + (DEGRADED if degraded(hook.get("session_id")) else "")),
     }))
 
 
@@ -2162,6 +2247,8 @@ def main():
         handle_pretooluse(hook)
     elif event == "permissionrequest":
         handle_permissionrequest(hook)
+    elif event == "permissiondenied":
+        handle_permissiondenied(hook)
     elif event == "userpromptsubmit":
         handle_userpromptsubmit(hook)
     elif event == "stop":
