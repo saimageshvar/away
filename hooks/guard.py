@@ -365,7 +365,11 @@ def away_cli_segment(toks):
     index = command_index(toks)
     if index is None or toks[index].rsplit("/", 1)[-1] != "away":
         return False
-    if index + 1 >= len(toks) or toks[index + 1] not in AWAY_CLI_SAFE:
+    if index + 1 >= len(toks):
+        return False
+    sub = toks[index + 1]
+    # A session scoping itself is allowed; its note is data, like a decision's text.
+    if sub not in AWAY_CLI_SAFE and not (sub in ("on", "off") and "--here" in toks):
         return False
     # Bare `>` was the only redirect checked, so `away decision x >~/…/guard.py`
     # and `2>~/…/guard.py` both walked through the exemption: shlex keeps the

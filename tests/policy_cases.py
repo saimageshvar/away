@@ -90,6 +90,10 @@ CASES = [
     ("decision redirected, fd-prefixed",
      "away decision x 2>~/.claude/away/hooks/guard.py", DENY, True),
     ("away off is not a safe subcommand", "away off", DENY, True),
+    ("session arm with a note naming python3",
+     '~/.claude/away/bin/away on --here "regenerate with python3"', DEFER, True),
+    ("session arm chained to a guard write",
+     '~/.claude/away/bin/away on --here x && rm ~/.claude/away/hooks/guard.py', DENY, True),
 
     # --- away OFF: the guard does nothing at all
     ("off: away off", "away off", DEFER, False),
