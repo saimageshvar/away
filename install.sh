@@ -142,7 +142,7 @@ for item in "$src"/* "$src"/.[!.]*; do
   case "$(basename "$item")" in state|.git|.github|.gitignore) continue ;; esac
   cp -R "$item" "$AWAY_HOME/"
 done
-mkdir -p "$AWAY_HOME/state/trash"
+mkdir -p "$AWAY_HOME/state"
 chmod +x "$AWAY_HOME/bin/"* "$AWAY_HOME/hooks/"*.sh "$AWAY_HOME/hooks/"*.py 2>/dev/null || true
 
 # For a tagged install the tag is truth: a source archive built from a branch can

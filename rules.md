@@ -24,17 +24,20 @@ because the command was not found.
 - Defer only what changes which customers see a surface, production behaviour, or scope.
 - A deferred item gets evidence, options, and your recommendation. Never a bare question.
 
-## Nothing can be approved
+## When the harness says no
 
-- Any action that needs operator approval is unavailable. Route around it or defer it.
-- Never retry a denied command. The denial will not change while the operator is away.
-- Push to your feature branch freely. A push to main, master, develop or staging is never
-  yours while away: commit the work and leave it unpushed.
-- Anything reaching off this machine is the operator's: deploys, releases, publishes, a
-  remote shell, a write to a remote database or service. A denial may name a tool no
-  written rule lists — an on-device model reads the command too, and it can only ever
-  add a denial, never grant one. Rewording a command to look harmless is not a route
-  around the rule. Defer the work and say so.
+The permission rules and auto mode decide what runs; nothing can be approved while the
+operator is away. Check first with `away perms "<command>"`, or `away perms` for every rule.
+Never retry a denied command, and never reword one to slip past a rule.
+
+- A push is denied: keep committing locally and carry on. The branch stays unpushed for the
+  operator.
+- A delete is denied: leave the files. Record it with
+  `~/.claude/away/bin/away decision "not done: <command> - <why>"` and carry on.
+- Anything else is denied: route around it, or defer it with evidence, options and your
+  recommendation. Finish everything it does not block.
+- After repeated blocks auto mode pauses and every call is refused. When a denial says the
+  session is degraded, land your work, record what is not done, and stop.
 
 ## Keep the tree clean
 

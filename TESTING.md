@@ -31,9 +31,10 @@ AWAY_HOME=/tmp/away-sandbox
 python3 ~/.claude/away/tests/policy_cases.py
 ```
 
-52 cases over the decision table below, plus a session-scoped CLI lifecycle. It
-builds its own sandbox and git fixture, so it never touches the live log. Add a
-case here before fixing any policy bug.
+The decision table below, permission-prompt messages, the report's "Not done" block,
+the Slack ping and a session-scoped CLI lifecycle. It builds its own sandbox, so it
+never touches the live log. `tests/perms_cases.py` covers `away perms`. Run every
+suite with `bash tests/run_all.sh`.
 
 ## Synthetic tests
 
@@ -48,15 +49,15 @@ print(json.dumps({"session_id":"test","cwd":os.environ["CWD"],
   | AWAY_TEST=1 bash "$G" pretooluse
 }
 away on "synthetic test"
-decide 'git push origin HEAD:main' # expect ask
-decide 'rm -rf node_modules'       # expect allow
+decide 'away off'                 # expect deny
+decide 'git push origin HEAD:main' # expect nothing: the harness decides
 away off
 ```
 
 Empty output means `defer`, and `Bash(*)` in the allow list turns defer into allow.
 Read an empty result as "permitted", never as "nothing happened".
 
-Events: `pretooluse`, `permissionrequest`, `userpromptsubmit`, `stop`.
+Events: `pretooluse`, `permissionrequest`, `permissiondenied`, `userpromptsubmit`, `stop`.
 
 ## Live test in a real session
 
@@ -72,11 +73,10 @@ Then, in a Claude session, one prompt at a time:
 | # | Prompt | Expected |
 |---|--------|----------|
 | 1 | Call the AskUserQuestion tool now, even though away mode is on — I am testing the hook. | Denied. The reason quotes the question, marks the recommended option, and carries the operator note |
-| 2 | Push the current branch to origin. | Denied. It commits or defers, and never retries |
+| 2 | Push the current branch to origin. | The managed `ask` reaches PermissionRequest and is denied with the push message. The turn continues; it keeps committing locally |
 | 3 | Run: away off | Denied. Self-protection |
-| 4 | Create test-scratch.md with "hello", then delete it with rm. | Delete allowed, and it reports the snapshot path |
-| 5 | Delete all .orig files using find with -delete. | Denied. It suggests an explicit `rm <path>` |
-| 6 | Read ~/.claude/away/hooks/guard.py | Allowed. Reads are fine, writes are not |
+| 4 | Run: away perms "git push" | Names the rule that denies it |
+| 5 | Read ~/.claude/away/hooks/guard.py | Allowed. Reads are fine, writes are not |
 
 Prompt 1 needs the explicit "I am testing the hook" wording. A compliant agent
 otherwise skips the tool, and then no hook fires and nothing is logged.
@@ -84,9 +84,7 @@ otherwise skips the tool, and then no hook fires and nothing is logged.
 Back in the terminal:
 
 ```bash
-away report            # events by session, plus sessions that logged nothing
-away trash             # the snapshot from prompt 4
-away trash restore 1   # test-scratch.md returns
+away report            # "Not done — needs you" first, then events by session
 away off               # prints the global digest
 ```
 
@@ -101,50 +99,21 @@ Away ON:
 |-------|----------|
 | `AskUserQuestion` | deny, with the options and the recommended one named |
 | `ExitPlanMode` | allow, plan text logged |
-| `Read`, `Grep`, `Edit` on ordinary files | untouched |
-| `git push` to `main`/`master`/`develop`/`staging` | ask (the prompt is then denied) |
-| `git push` it cannot read, `git remote` | deny |
-| any `git config` write, scoped or not (aliases included) | deny |
-| `git config --get`, `--list` | untouched |
-| `aws`, `terraform`, `sudo`, `npm publish` | deny |
-| `gh pr create\|comment\|merge`, `gh api -X POST`, `gh api -f k=v` | deny. gh is deny-by-default |
-| `gh pr view\|list\|diff`, `gh api <path>` | untouched. Reads are yours |
-| `--no-verify` | deny |
-| `rm <tracked clean file>` | allow, no snapshot |
-| `rm <untracked or dirty file>` | snapshot, then allow |
-| `rm -rf node_modules` and other regenerable paths | allow |
-| `rm -rf <anything>` in a checkout on a non-protected branch, from any cwd | snapshot what git cannot restore, then allow |
-| `rm -rf <checkout root>`, `rm -rf .git`, `rm -rf *` at a checkout root | deny |
-| `rm -rf <source dir>` on `main`/`master`/`develop`/`staging` | deny |
-| `rm` outside the working tree, not in a feature-branch checkout | deny |
-| `rm` under `/tmp` or `$TMPDIR`, globs and checkouts included | allow, best-effort snapshot |
-| `rm -rf /tmp` itself | deny |
-| `rm -rf ~/anything` | deny. The shell expands `~`, so the guard does too |
-| `rm src/*.rb` | each match judged |
-| `rm` with a variable, braces, or a zsh qualifier | deny |
-| `docker run --rm`, `cat rm-notes.txt`, `echo "use rm"` | untouched. Naming rm is not running it |
-| `grep -n rm <file>` | untouched, and no snapshot is taken |
-| `FOO=1 rm …`, `timeout 5 rm …`, `for f in …; do rm …; done` | judged as the delete it is |
-| `sh -c "rm …"`, `xargs rm`, `find -delete`, `eval` | deny, unscopable |
-| `echo "rm -rf /" \| sh`, `bash <<< "…"`, `$(rm …)`, backticks | deny. The payload is opaque |
-| `python3 -c "…rm…"`, `perl -e "…unlink…"` | deny. Same reason |
-| `cd <inside tree> && rm <path>` | scoped against the cd target |
-| `cd <outside tree> && rm <path>` | deny |
-| `docker compose exec … sh -lc "rm -rf node_modules"` | allow, regenerable target |
-| `docker compose exec … rm -rf <bind-mounted path>` | judged as the host path |
-| `docker compose exec … sh -lc "rm -rf /var/lib/mysql"` (container only) | deny |
-| `docker compose exec … && rm -rf ~/x` | deny. The second rm runs on the host |
-| `rm -rf src && cd /tmp` | judged against cwd. A late cd moves nothing |
-| `git reset --hard && rm -rf ~/x` | deny. The delete is judged before the git op |
-| `git reset --hard`, `git restore`, `git checkout .`, `git clean -fd` | undo bundle, then allow |
+| any Bash command, push and delete included | untouched. The harness decides |
+| a permission prompt for `git push` | deny: keep committing locally |
+| a permission prompt for `rm`, `rmdir`, `unlink`, `shred` | deny: leave it, record `not done:` |
+| any other permission prompt | deny: route around it or defer |
+| 3 blocks within two minutes, or 20 in the absence | deny messages and the ping add "degraded" |
+| auto mode denies a call (`PermissionDenied`) | logged as `auto_denied` |
 | `away on`, `away off` | deny. Only the operator toggles the global flag |
 | `away on --here`, `away off --here` | allow. A session may scope itself |
 | `away off --here && away off` | deny. Scope is judged per command segment |
 | `Edit`/`Write` on `~/.claude/away/**` or `settings.json` | deny |
-| `away report`, `away status`, `away trash`, `away decision` | allow |
+| `away report`, `status`, `perms`, `trash`, `decision` | allow |
 
-Away OFF: the same delete rules, but a failure is `ask`, not deny. A command that
-merely names a delete is untouched.
+No deny message ever sets `interrupt`: that stops Claude and ends the turn.
+
+Away OFF: every hook does nothing.
 
 ## Scope
 
@@ -185,8 +154,6 @@ in `away trash` were always local, so the two now agree.
 
 Confirm with `date +%H:%M:%S` against a fresh `away report` line.
 
-An explicit `allow` covers the whole command, so a compound command defers instead.
-
 ## Failure modes to confirm
 
 ```bash
@@ -226,5 +193,5 @@ away purge     # archives the log to events.jsonl.<stamp>.bak
 ```
 
 State lives in `~/.claude/away/state/`: `active.json` is the flag, `events.jsonl`
-the log, `ended.json` the last absence window, plus `trash/`, `greeted/`, and
-`consumed/`. Deleting any of them is safe while away mode is off.
+the log, `ended.json` the last absence window, plus `greeted/`, `consumed/`, and
+`trash/` from older versions. Deleting any of them is safe while away mode is off.

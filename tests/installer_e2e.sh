@@ -47,7 +47,7 @@ case "$out" in *"self-test passed"*) ok "the guard was verified before install" 
 [ -L "$FAKE/.local/bin/away" ] && ok "the CLI was linked" || bad "the CLI was linked"
 check "VERSION came from the archive" \
   "$(cat "$FAKE/.claude/away/VERSION" 2>/dev/null | tr -d '[:space:]')" "9.9.9"
-[ -d "$FAKE/.claude/away/state/trash" ] && ok "state was created" || bad "state was created"
+[ -d "$FAKE/.claude/away/state" ] && ok "state was created" || bad "state was created"
 # .github holds a release workflow that is meaningless once installed.
 [ -d "$FAKE/.claude/away/.github" ] && bad "the workflow dir was excluded" \
   || ok "the workflow dir was excluded"
@@ -66,6 +66,7 @@ check "doctor exits 0" "$rc" "0"
 echo
 echo "upgrade keeps history:"
 printf '{"event":"from the last absence"}\n' > "$FAKE/.claude/away/state/events.jsonl"
+mkdir -p "$FAKE/.claude/away/state/trash"
 printf 'x\n' > "$FAKE/.claude/away/state/trash/snapshot-1"
 printf '1.0.0\n' > "$FAKE/.claude/away/VERSION"
 out=$(HOME="$FAKE" AWAY_TEST=1 AWAY_NO_UPDATE_CHECK=1 AWAY_NO_SETUP=1 \

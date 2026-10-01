@@ -1,5 +1,26 @@
 # Changelog
 
+## 2.0.0
+
+Thin away: the permission rules and auto mode decide what runs; away mode makes sure an
+agent never waits on them and knows how to carry on when refused.
+
+- **Prompts are denied with a way forward.** Every permission prompt while away is denied
+  with a message: a push means keep committing locally, a delete means leave it and record
+  `not done:`, anything else means route around it or defer. No `interrupt`, so the turn
+  goes on.
+- **`away perms [cmd]`** lists every ask/deny rule from managed, user and project settings,
+  or gives a best-effort verdict for one command. It never says "allowed".
+- **Auto-mode refusals** are logged through a new `PermissionDenied` hook. A session that
+  looks paused (3 blocks within two minutes, or 20 in the absence) is told it is degraded.
+- **`away report` opens with "Not done — needs you".**
+- **Removed:** `push_guard.py`, the outward-command token list, the gh allowlist, the
+  on-device model pass, delete scoping and snapshots, container-delete mapping, and the
+  git undo bundle. With away mode off, the hooks do nothing. `away trash` stays read-only
+  for existing snapshots.
+- **Migration:** `away setup` removes a registered `push_guard.py` hook before anything
+  else, registers `PermissionDenied`, and no longer offers to remove `ask` rules on deletes.
+
 ## 1.8.0
 
 Protected-branch pushes ask instead of being refused, and hand-back pings get short.
