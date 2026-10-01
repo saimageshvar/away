@@ -353,7 +353,7 @@ def apply_permissions(settings):
 
 def audit_payload(f):
     for rel in ("hooks/guard.sh", "hooks/guard.py", "bin/away", "bin/report.py",
-                "bin/setup.py", "bin/update.py", "rules.md"):
+                "bin/setup.py", "bin/update.py", "bin/perms.py", "rules.md"):
         p = AWAY / rel
         if not p.exists():
             f.fail("missing %s" % rel, "install is incomplete at %s" % AWAY,
@@ -487,7 +487,7 @@ def install_skill():
 
 
 def make_executable():
-    for rel in ("bin/away", "bin/report.py", "bin/setup.py", "bin/update.py",
+    for rel in ("bin/away", "bin/report.py", "bin/setup.py", "bin/update.py", "bin/perms.py",
                 "hooks/guard.sh", "hooks/guard.py", "tests/policy_cases.py"):
         p = AWAY / rel
         if p.exists():

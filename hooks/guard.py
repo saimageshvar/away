@@ -805,6 +805,12 @@ def handle_userpromptsubmit(hook):
             try:
                 head.append("")
                 head.append(RULES.read_text(encoding="utf-8"))
+                rc, out, _ = run([sys.executable, str(AWAY / "bin" / "perms.py"), "--brief"],
+                                 cwd=hook.get("cwd"))
+                if rc == 0 and out.strip():
+                    head += ["", "Rules the harness applies (all denied while away; "
+                             "`away perms \"<cmd>\"` checks one):",
+                             out.decode("utf-8", "replace").rstrip()]
             except Exception:
                 head.append("(rules.md unreadable: deny every question, never wait.)")
         else:

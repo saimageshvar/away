@@ -22,7 +22,7 @@ if [ -z "$PY" ]; then
   exit 1
 fi
 
-mkdir -p "$STATE/trash"
+mkdir -p "$STATE"
 
 elapsed_human() {
   local since=$1 now diff hours mins
@@ -565,6 +565,11 @@ with open(os.environ["EVENTS"], "a", encoding="utf-8") as f:
     fi
     ;;
 
+  perms)
+    "$PY" "$AWAY_HOME/bin/perms.py" "$@"
+    ;;
+
+  # ponytail: read-only for snapshots older versions took; remove after 2026-10-15.
   trash)
     sub="${1:-list}"
     case "$sub" in
@@ -587,8 +592,10 @@ away — away mode for every running Claude Code agent
   away report              digest for the current or last absence
   away report --since 2h   digest for a time window (m/h/d)
   away report --all        include synthetic test events, tagged TEST
-  away trash               list snapshots taken while away
-  away trash restore <id>  restore one snapshot
+  away perms               every ask/deny rule the harness applies, by source
+  away perms "<cmd>"       best-effort: would the harness deny this command?
+  away trash               list snapshots older versions took (read-only)
+  away trash restore <id>  restore one of them
   away decision "..."      record a call made without asking (for agents)
   away purge               archive the event log and start a fresh one
 
