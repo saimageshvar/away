@@ -52,7 +52,9 @@ cat > "$SETTINGS" <<'EOF'
   "hooks": {
     "PreToolUse": [
       { "matcher": "AskUserQuestion",
-        "hooks": [ { "type": "command", "command": "bash /somewhere/unrelated.sh" } ] }
+        "hooks": [ { "type": "command", "command": "bash /somewhere/unrelated.sh" } ] },
+      { "matcher": "Bash",
+        "hooks": [ { "type": "command", "command": "python3 '/old/away/hooks/push_guard.py'" } ] }
     ]
   },
   "permissions": {
@@ -76,7 +78,8 @@ out=$($AWAY setup --yes 2>&1); rc=$?
 check "setup exits 0" "$rc" "0"
 
 for pair in "PreToolUse pretooluse" "PermissionRequest permissionrequest" \
-            "Stop stop" "UserPromptSubmit userpromptsubmit"; do
+            "Stop stop" "UserPromptSubmit userpromptsubmit" \
+            "PermissionDenied permissiondenied"; do
   set -- $pair
   check "hook $1 registered once" "$(q "len(mine('$1','$2'))")" "1"
 done
@@ -88,9 +91,12 @@ check "hook path points at this home" \
 check "the unrelated PreToolUse hook survived" \
   "$(q "sum(1 for e in hooks('PreToolUse') if 'unrelated' in (e.get('command') or ''))")" "1"
 
+check "the retired push_guard hook was removed" \
+  "$(q "'push_guard' in json.dumps(d.get('hooks'))")" "False"
+
 check "defaultMode was fixed" "$(q "d['permissions']['defaultMode']")" "auto"
-check "the delete ask rule was removed" \
-  "$(q "'Bash(rm:*)' in d['permissions']['ask']")" "False"
+check "a delete ask rule is left to the harness" \
+  "$(q "'Bash(rm:*)' in d['permissions']['ask']")" "True"
 check "an unrelated ask rule was kept" \
   "$(q "'Bash(sudo:*)' in d['permissions']['ask']")" "True"
 check "allow list untouched" "$(q "d['permissions']['allow']")" "['Bash(git status:*)']"

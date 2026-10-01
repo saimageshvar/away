@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
-"""Tests for the permission audit's rule matching.
+"""Tests for the permission audit and hook wiring.
 
 A false positive here is not cosmetic: setup offers to DELETE the rule it flags.
-`Bash(terraform *)` was flagged as a delete rule on a real machine, because the
-first version matched "rm" as a substring of "terraform".
 
 Run: python3 tests/audit_cases.py
 """
@@ -28,31 +26,6 @@ def check(name, got, want):
     else:
         FAIL.append(name)
         print("  FAIL %s\n       want %r, got %r" % (name, want, got))
-
-
-def test_deletion_matching():
-    print("rules that DO gate a delete:")
-    # The invariant is consistency with guard.py's own DELETION_HINT, not a
-    # hand-tuned word list: the audit must flag exactly what the guard gates.
-    # That is why a hyphen-adjacent `rm` (`git rm --cached`) counts.
-    for rule in ("Bash(rm:*)", "Bash(rm -rf:*)", "Bash(rmdir:*)",
-                 "Bash(unlink:*)", "Bash(shred:*)", "Bash(srm:*)",
-                 "Bash(find . -delete)", "Bash(RM:*)", "Bash(git rm --cached:*)"):
-        check(rule, audit.touches_deletion(rule), True)
-
-    print("\nrules that merely CONTAIN those letters:")
-    # Every one of these is a real rule somebody has, and removing any of them
-    # would be silent damage to their setup.
-    for rule in ("Bash(terraform *)", "Bash(terraform apply:*)",
-                 "Bash(npm run format:*)", "Bash(rman:*)",
-                 "Bash(charm:*)", "Bash(swarm:*)",
-                 "Bash(confirm:*)", "Bash(alarm-check)", "Bash(normalize:*)"):
-        check(rule, audit.touches_deletion(rule), False)
-
-    print("\nnon-Bash tools are never delete rules:")
-    for rule in ("Read(~/rm-notes.md)", "WebFetch(domain:rm.example.com)",
-                 "Edit(shred.txt)"):
-        check(rule, audit.touches_deletion(rule), False)
 
 
 def test_broad_bash():
@@ -82,32 +55,12 @@ def test_mode_audit():
           (False, True))
 
 
-def test_deny_verdicts():
-    """deny outranks the guard, so it is never a failure -- but a deny on deletes
-    makes the away log claim deletes that never happened, and that must be said."""
+def test_deny_is_left_alone():
     print("\ndeny rules:")
     f = audit.Findings()
     audit.audit_permissions({"permissions": {
-        "defaultMode": "auto", "deny": ["Bash(curl:*)", "Bash(sudo:*)"]}}, f)
-    check("an ordinary deny list is clean", (f.failed, f.warned), (False, False))
-
-    f = audit.Findings()
-    audit.audit_permissions({"permissions": {
-        "defaultMode": "auto", "deny": ["Bash(rm:*)"]}}, f)
-    check("a deny on deletes never fails", f.failed, False)
-    check("a deny on deletes warns", f.warned, True)
-    text = " ".join(r[1] + " " + (r[2] or "") for r in f.rows)
-    check("the warning explains the stale log", "never happened" in text, True)
-    check("the warning says it is left alone", "leaves them be" in text, True)
-
-    # A mixed list must report both halves, not collapse into one verdict.
-    f = audit.Findings()
-    audit.audit_permissions({"permissions": {
         "defaultMode": "auto", "deny": ["Bash(rm:*)", "Bash(curl:*)"]}}, f)
-    rows = [r for r in f.rows if "deny" in r[1]]
-    check("a mixed deny list reports two rows", len(rows), 2)
-
-    # Nothing in apply_permissions may touch deny, ever.
+    check("a deny list is clean", (f.failed, f.warned), (False, False))
     settings = {"permissions": {"defaultMode": "auto", "deny": ["Bash(rm:*)"]}}
     audit.apply_permissions(settings)
     check("apply never edits deny", settings["permissions"]["deny"], ["Bash(rm:*)"])
@@ -125,7 +78,7 @@ def test_apply_is_surgical():
     audit.apply_permissions(settings)
     p = settings["permissions"]
     check("mode was fixed", p["defaultMode"], "auto")
-    check("the delete ask went", "Bash(rm:*)" in p["ask"], False)
+    check("a delete ask is the harness's, and stays", "Bash(rm:*)" in p["ask"], True)
     check("the broad ask went", "Bash(*)" in p["ask"], False)
     check("terraform survived in ask", "Bash(terraform *)" in p["ask"], True)
     check("sudo survived in ask", "Bash(sudo:*)" in p["ask"], True)
@@ -150,15 +103,37 @@ def test_hook_identity():
     check("a missing command is not ours", audit.is_our_hook({}), False)
 
 
+def test_retired_push_guard():
+    """A registered push_guard.py whose file is gone exits 2 and blocks every Bash call."""
+    print("\nretired push_guard hook:")
+    retired = {"type": "command", "command": "python3 '/x/.claude/away/hooks/push_guard.py'"}
+    neighbour = {"type": "command", "command": "bash /somewhere/else.sh"}
+    settings = {"hooks": {
+        "PreToolUse": [{"matcher": "Bash", "hooks": [retired, neighbour]}],
+        "Stop": [{"hooks": [dict(retired)]}],
+    }}
+    f = audit.Findings()
+    audit.audit_hooks(settings, f)
+    check("doctor fails on it", any("push_guard" in r[1] for r in f.rows if r[0] == "fail"), True)
+    changes = audit.apply_hooks(settings)
+    flat = [e for gs in settings["hooks"].values() for g in gs for e in g.get("hooks") or []]
+    check("setup removes it everywhere", any("push_guard" in e["command"] for e in flat), False)
+    check("its neighbour survives", neighbour in flat, True)
+    check("setup says so", any("push_guard" in c for c in changes), True)
+    settings = {"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [dict(retired)]}]}}
+    audit.remove_hooks(settings)
+    check("uninstall removes it too", settings.get("hooks", {}), {})
+
+
 def main():
     print("away audit cases")
     print()
-    test_deletion_matching()
     test_broad_bash()
     test_mode_audit()
-    test_deny_verdicts()
+    test_deny_is_left_alone()
     test_apply_is_surgical()
     test_hook_identity()
+    test_retired_push_guard()
     print()
     if FAIL:
         print("away audit cases: %d failed, %d passed." % (len(FAIL), len(PASS)),

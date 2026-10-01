@@ -13,7 +13,6 @@ the hook paths in place rather than appending a second copy.
 
 import json
 import os
-import re
 import shutil
 import stat
 import subprocess
@@ -34,16 +33,16 @@ HOOK_EVENTS = [
     ("PermissionRequest", "permissionrequest", "*", 20),
     ("Stop", "stop", None, 15),
     ("UserPromptSubmit", "userpromptsubmit", None, 15),
+    ("PermissionDenied", "permissiondenied", "*", 10),
 ]
+
+# Hand-registered by older installs. Its file is gone, and a PreToolUse hook whose
+# script is missing exits 2, which blocks every Bash call.
+RETIRED_HOOK = "push_guard.py"
 
 # A permission mode that still raises prompts is fatal to away mode: nobody is
 # there to answer, so the agent stalls instead of routing around.
 SAFE_MODES = {"auto", "bypassPermissions", "dontAsk"}
-
-# Token boundaries, not substrings: matching "rm" anywhere flagged
-# `Bash(terraform *)` as a delete rule, and setup offered to remove it. The same
-# shape as guard.py's own DELETION_HINT, deliberately.
-DELETION_HINT = re.compile(r"\b(rm|rmdir|unlink|shred|srm)\b|(?:^|\s)-delete\b", re.I)
 
 RED, YEL, GRN, DIM, OFF = "\033[31m", "\033[33m", "\033[32m", "\033[2m", "\033[0m"
 if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
@@ -134,12 +133,36 @@ def is_our_hook(entry):
     return "/hooks/guard.sh" in cmd and hook_event_arg(entry) in OUR_EVENT_ARGS
 
 
+def is_retired_hook(entry):
+    return RETIRED_HOOK in (entry.get("command") or "")
+
+
+def drop_retired(hooks):
+    changes = []
+    for event in list(hooks):
+        for group in hooks[event] or []:
+            entries = group.get("hooks") or []
+            keep = [e for e in entries if not is_retired_hook(e)]
+            if len(keep) != len(entries):
+                group["hooks"] = keep
+                changes.append("removed the retired push_guard hook from %s" % event)
+        hooks[event] = [g for g in hooks[event] or [] if g.get("hooks")]
+        if not hooks[event]:
+            hooks.pop(event)
+    return changes
+
+
 # ---------------------------------------------------------------- hooks
 
 
 def audit_hooks(settings, f):
     """Every event must be registered exactly once, pointing at THIS away home."""
     hooks = settings.get("hooks") or {}
+    if any(is_retired_hook(e) for groups in hooks.values() for g in groups or []
+           for e in g.get("hooks") or []):
+        f.fail("the retired push_guard hook is still registered",
+               "its script is gone, so it fails every Bash call it runs on.",
+               "run `away setup`")
     for event, arg, matcher, _timeout in HOOK_EVENTS:
         groups = hooks.get(event) or []
         mine = []
@@ -185,8 +208,8 @@ def audit_hooks(settings, f):
 
 def apply_hooks(settings):
     """Returns a list of human-readable changes made."""
-    changes = []
     hooks = settings.setdefault("hooks", {})
+    changes = drop_retired(hooks)
     for event, arg, matcher, timeout in HOOK_EVENTS:
         groups = hooks.setdefault(event, [])
         found = None
@@ -221,8 +244,8 @@ def apply_hooks(settings):
 
 
 def remove_hooks(settings):
-    changes = []
     hooks = settings.get("hooks") or {}
+    changes = drop_retired(hooks)
     for event, arg, _m, _t in HOOK_EVENTS:
         groups = hooks.get(event) or []
         for group in groups:
@@ -260,12 +283,6 @@ def is_broad_bash(rule):
     return arg in ("", "*", ":*", "*:*")
 
 
-def touches_deletion(rule):
-    if rule_tool(rule) not in ("Bash", ""):
-        return False
-    return bool(DELETION_HINT.search(rule_arg(rule)))
-
-
 def audit_permissions(settings, f, source="settings.json"):
     perms = settings.get("permissions") or {}
     mode = perms.get("defaultMode")
@@ -284,70 +301,15 @@ def audit_permissions(settings, f, source="settings.json"):
     else:
         f.ok("permissions.defaultMode is %r" % mode)
 
+    # An ask rule has nobody to answer it while away, so the harness's denial
+    # handles a narrow one. One matching every Bash call stalls everything.
     ask = [r for r in (perms.get("ask") or []) if isinstance(r, str)]
-    deny = [r for r in (perms.get("deny") or []) if isinstance(r, str)]
-
-    # Hook decisions do NOT bypass permission rules: Claude Code evaluates deny
-    # and ask regardless of what a PreToolUse hook returned. So an `ask` rule on
-    # a delete prompts even though the guard already answered `allow` -- and
-    # while away, nothing answers that prompt.
-    delete_asks = [r for r in ask if touches_deletion(r)]
-    if delete_asks:
-        f.fail("%d `ask` rule(s) collide with the guard on deletes" % len(delete_asks),
-               "%s\nThe guard already gates deletes: it snapshots to away trash,\n"
-               "then answers `allow`. An `ask` rule still prompts on top of that\n"
-               "decision, and while away nobody is there to answer it, so the\n"
-               "agent stalls on its first delete."
-               % "\n".join("  " + r for r in delete_asks),
-               "remove these from permissions.ask (setup can do this)")
-    else:
-        f.ok("no `ask` rule collides with the guard on deletes")
-
     broad_ask = [r for r in ask if is_broad_bash(r)]
     if broad_ask:
         f.fail("`ask` matches every Bash command",
-               "%s\nEvery shell command an away agent runs would wait for an\n"
-               "answer that never comes." % "\n".join("  " + r for r in broad_ask),
+               "%s\nEvery shell command an away agent runs would be denied."
+               % "\n".join("  " + r for r in broad_ask),
                "narrow or remove these (setup can do this)")
-
-    broad_deny = [r for r in deny if is_broad_bash(r)]
-    if broad_deny:
-        f.warn("`deny` matches every Bash command",
-               "%s\nThis is stricter than away mode, not looser, so it is safe --\n"
-               "but an away agent can do almost nothing."
-               % "\n".join("  " + r for r in broad_deny))
-
-    # A deny rule is always safe -- deny wins over the guard's `allow`, so the
-    # delete is simply blocked. The catch is reporting, not safety: the guard
-    # runs FIRST, so it has already snapshotted and logged `rm_allowed` by the
-    # time deny blocks the call. The digest then claims a delete that never
-    # happened, which is a lie in the one artifact the operator reads on return.
-    delete_denies = [r for r in deny if touches_deletion(r)]
-    if delete_denies:
-        f.warn("%d `deny` rule(s) cover deletes" % len(delete_denies),
-               "%s\nThese WIN over the guard, so nothing can be deleted -- that is\n"
-               "stricter than away mode, never looser, and setup leaves them be.\n"
-               "But the guard runs before the rule is evaluated, so it snapshots\n"
-               "and logs the delete as allowed before deny blocks it. Expect\n"
-               "`away report` to name deletes that never happened, and stale\n"
-               "snapshots in `away trash`."
-               % "\n".join("  " + r for r in delete_denies))
-
-    other_denies = [r for r in deny if r not in delete_denies]
-    if other_denies:
-        f.ok("%d `deny` rule(s) left alone" % len(other_denies),
-             "deny outranks the guard, so it is stricter and never conflicts.")
-
-    # Allow rules are not a hazard: an allow only skips the PROMPT, and the guard
-    # has already returned its decision by then. Deliberately not claiming more
-    # than that -- the docs guarantee precedence over allow rules for a hook that
-    # exits 2, and the guard denies with a JSON decision instead so it can hand
-    # the agent a reason to act on.
-    allow = perms.get("allow") or []
-    if allow:
-        f.ok("%d `allow` rule(s) left alone" % len(allow),
-             "an allow rule skips the prompt; it does not skip the guard, which\n"
-             "runs first on every tool call.")
 
     if source == "settings.json" and SETTINGS_LOCAL.exists():
         local, err = read_json(SETTINGS_LOCAL)
@@ -359,7 +321,7 @@ def audit_permissions(settings, f, source="settings.json"):
             if lp.get("defaultMode") and lp["defaultMode"] not in SAFE_MODES:
                 problems.append("defaultMode: %r" % lp["defaultMode"])
             problems += ["ask: " + r for r in (lp.get("ask") or [])
-                         if isinstance(r, str) and (touches_deletion(r) or is_broad_bash(r))]
+                         if isinstance(r, str) and is_broad_bash(r)]
             if problems:
                 f.fail("settings.local.json overrides these with conflicts",
                        "\n".join("  " + p for p in problems) +
@@ -377,8 +339,7 @@ def apply_permissions(settings):
         changes.append("set permissions.defaultMode to \"auto\" (was %r)" % was)
     ask = perms.get("ask")
     if isinstance(ask, list):
-        keep = [r for r in ask
-                if not (isinstance(r, str) and (touches_deletion(r) or is_broad_bash(r)))]
+        keep = [r for r in ask if not (isinstance(r, str) and is_broad_bash(r))]
         for r in ask:
             if r not in keep:
                 changes.append("removed permissions.ask rule %r" % r)
