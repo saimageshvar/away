@@ -18,6 +18,9 @@ agent never waits on them and knows how to carry on when refused.
   on-device model pass, delete scoping and snapshots, container-delete mapping, and the
   git undo bundle. With away mode off, the hooks do nothing. `away trash` stays read-only
   for existing snapshots.
+- **Admin commands stay with the operator.** While away, an agent may not run `away purge`,
+  `setup`, `update` or `uninstall`. `away on --here "<note>"` no longer reads a note that
+  names a tool as tampering.
 - **Migration:** `away setup` removes a registered `push_guard.py` hook before anything
   else, registers `PermissionDenied`, and no longer offers to remove `ask` rules on deletes.
 
