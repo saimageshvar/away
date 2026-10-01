@@ -242,6 +242,33 @@ def permission_prompt_cases(tree):
     return found
 
 
+def report_cases():
+    """The report opens with what was not done, and only that."""
+    sandbox = Path(tempfile.mkdtemp(prefix="away-report-"))
+    (sandbox / "state").mkdir(parents=True)
+    recs = [
+        {"event": "deferred", "tool": "Bash", "detail": {"command": "git push origin x"}},
+        {"event": "auto_denied", "tool": "Bash", "detail": {"command": "rm -rf build"}},
+        {"event": "self_reported_decision", "detail": {"decision": "not done: drop table t"}},
+        {"event": "self_reported_decision", "detail": {"decision": "chose option 2"}},
+    ]
+    with open(sandbox / "state" / "events.jsonl", "w") as log:
+        for rec in recs:
+            log.write(json.dumps(dict(rec, ts="2026-10-01T00:00:00Z", session="s")) + "\n")
+    out = subprocess.run([sys.executable, str(HOME / "bin" / "report.py"), "digest"],
+                         capture_output=True, text=True, timeout=30,
+                         env=dict(os.environ, AWAY_HOME=str(sandbox))).stdout
+    block = out.split("Not done — needs you:")[-1].split("\n\n")[0]
+    found = []
+    for want in ("git push origin x", "rm -rf build", "not done: drop table t"):
+        if want not in block:
+            found.append("report: %r missing from Not done" % want)
+    if "chose option 2" in block:
+        found.append("report: an ordinary decision was listed as not done")
+    shutil.rmtree(sandbox, ignore_errors=True)
+    return found
+
+
 def ping_cases(tree):
     """The hand-back report: asked for once per stop, sent from the hook, never looped."""
     import http.server
@@ -347,7 +374,8 @@ def main():
     failures += resilience_cases(tree)
     failures += ping_cases(tree)
     failures += permission_prompt_cases(tree)
-    ran += 29
+    failures += report_cases()
+    ran += 33
     shutil.rmtree(sandbox, ignore_errors=True)
     shutil.rmtree(tree, ignore_errors=True)
 

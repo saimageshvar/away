@@ -27,7 +27,16 @@ LABELS = {
     "self_reported_decision": "DECIDED (self-reported)",
     "checkpoint": "CHECKPOINT",
     "relax_allowed": "delete allowed (model-scoped)",
+    "auto_denied": "DENIED (auto mode)",
 }
+
+
+def not_done(rec):
+    if rec.get("event") in ("deferred", "auto_denied"):
+        return True
+    text = (rec.get("detail") or {}).get("decision") if isinstance(rec.get("detail"), dict) else None
+    return rec.get("event") == "self_reported_decision" and \
+        (text or "").strip().lower().startswith("not done:")
 
 
 SKIPPED_SYNTHETIC = 0
@@ -186,6 +195,13 @@ def digest(since_epoch, only_session=None):
     head = "  ".join("%s %d" % (LABELS.get(k, k), v) for k, v in sorted(tally.items()))
 
     lines = [head, zone_header(), "-" * max(28, min(len(head), 78))]
+    pending = [r for r in events if not_done(r)]
+    if pending:
+        lines.append("Not done — needs you:")
+        for rec in pending:
+            lines.append("  %s  %-14s %s" % (to_local(rec.get("ts")),
+                                             rec.get("label", ""), summarize(rec)))
+        lines.append("")
     seen = roster(since_epoch)
     active = {r.get("session") for r in seen}
     if only_session:
@@ -222,6 +238,7 @@ def digest(since_epoch, only_session=None):
     return "\n".join(lines).rstrip() + synthetic_note()
 
 
+# ponytail: trash is read-only, for snapshots older versions took; remove after 2026-10-15.
 def bundles():
     if not TRASH.exists():
         return []
