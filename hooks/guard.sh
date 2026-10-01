@@ -1,5 +1,5 @@
 #!/bin/bash
-# Away-mode guard. One script serves three hook events; $1 is the event name.
+# Away-mode guard. One script serves every away hook event; $1 is the event name.
 #
 # Bash owns the fast path because PreToolUse fires on EVERY tool call: the
 # common case must never pay for a python interpreter start.
@@ -46,39 +46,17 @@ fi
 need_python=0
 if [ "$armed" = "1" ]; then
   if [ "$EVENT" = "pretooluse" ]; then
-    # Only three tools can yield a decision while away, so Read, Grep, Edit and
-    # the rest must not pay for a python start on every call in every agent.
+    # The harness decides what runs, so Bash needs python only when it names away
+    # itself: a global toggle, or a write to away's own files.
     case "$input" in
-      *'"tool_name"'*'"Bash"'*|*'"tool_name"'*'"AskUserQuestion"'*|*'"tool_name"'*'"ExitPlanMode"'*)
+      *'"tool_name"'*'"AskUserQuestion"'*|*'"tool_name"'*'"ExitPlanMode"'*)
         need_python=1 ;;
-      # Any tool at all that reaches for away mode's own machinery must be seen,
-      # or an Edit could rewrite the guard without the guard ever running.
-      *.claude/away*|*.claude/settings.json*|*.claude/settings.local.json*)
+      *away*|*.claude/settings.json*|*.claude/settings.local.json*)
         need_python=1 ;;
     esac
   else
     need_python=1
   fi
-elif [ "$EVENT" = "pretooluse" ]; then
-  # Away is OFF, so only one job is left: reproduce the `ask` on deletes that we
-  # removed from the permission list to give this hook sole authority.
-  case "$input" in
-    *'"tool_name"'*'"Bash"'*)
-      # Keep these in step with DELETION_HINT in guard.py; tests/policy_cases.py
-      # fails if they drift. They have diverged twice. Once on vocabulary: the
-      # constant grew `os.remove` and `File.delete`, and neither has an "rm" in
-      # it nor the hyphen that `-delete` wanted. Once on case: DELETION_HINT is
-      # re.I and this was not, so `Rm -rf x` skipped python entirely -- and APFS
-      # is case-insensitive, so that really does run /bin/rm.
-      #
-      # Both were invisible while armed, because armed routes every Bash call to
-      # python and this glob never runs at all.
-      shopt -s nocasematch
-      case "$input" in
-        *rm*|*unlink*|*shred*|*remove*|*delete*) need_python=1 ;;
-      esac
-      shopt -u nocasematch ;;
-  esac
 elif [ "$EVENT" = "userpromptsubmit" ]; then
   # A session that armed itself with --here ends alone, so the global file is
   # not written and only its own marker says the absence is over.

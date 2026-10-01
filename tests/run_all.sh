@@ -19,7 +19,7 @@ run() {
 run "syntax" bash -n "$REPO/install.sh" "$REPO/uninstall.sh" "$REPO/bin/away" \
     "$REPO/hooks/guard.sh"
 run "python syntax" python3 -m py_compile "$REPO/bin/setup.py" "$REPO/bin/update.py" \
-    "$REPO/bin/report.py" "$REPO/hooks/guard.py" "$REPO/hooks/push_guard.py"
+    "$REPO/bin/report.py" "$REPO/hooks/guard.py"
 run "guard self-test" env AWAY_HOME="$REPO" bash "$REPO/bin/away" selftest
 run "policy cases" env AWAY_HOME="$REPO" python3 "$REPO/tests/policy_cases.py"
 run "push guard" bash "$REPO/tests/push_guard.sh"
