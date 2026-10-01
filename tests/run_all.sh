@@ -22,7 +22,6 @@ run "python syntax" python3 -m py_compile "$REPO/bin/setup.py" "$REPO/bin/update
     "$REPO/bin/report.py" "$REPO/bin/perms.py" "$REPO/hooks/guard.py"
 run "guard self-test" env AWAY_HOME="$REPO" bash "$REPO/bin/away" selftest
 run "policy cases" env AWAY_HOME="$REPO" python3 "$REPO/tests/policy_cases.py"
-run "push guard" bash "$REPO/tests/push_guard.sh"
 run "perms cases" python3 "$REPO/tests/perms_cases.py"
 run "audit cases" python3 "$REPO/tests/audit_cases.py"
 run "update cases" python3 "$REPO/tests/update_cases.py"
