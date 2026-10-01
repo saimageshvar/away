@@ -57,6 +57,8 @@ CMD_PREFIXES = {"sudo", "env", "nice", "time", "nohup", "command", "builtin",
 # Away mode is worthless if an agent can switch it off, so the guard protects its
 # own machinery. Only the operator, from their own terminal, may disarm it.
 AWAY_TOGGLE = re.compile(r"\baway\s+(on|off)\b")
+# Rewiring the hooks or archiving the log the operator reads on return is theirs too.
+AWAY_ADMIN = re.compile(r"\baway\s+(purge|setup|update|uninstall)\b|\buninstall\.sh\b")
 SELF_PATHS = re.compile(r"\.claude/(away\b|settings\.json|settings\.local\.json)")
 # An interpreter can do anything, so treat one as a mutation of whatever it names.
 MUTATES = re.compile(
@@ -454,6 +456,11 @@ def handle_pretooluse(hook):
                  "they do it from their own terminal. `away on --here` and "
                  "`away off --here` scope it to this session, and `away report`, "
                  "`away status`, `away perms` and `away decision` are yours too.")
+            return
+        if AWAY_ADMIN.search(cmd):
+            deny(hook, tool,
+                 "purge, setup, update and uninstall belong to the operator while away "
+                 "mode is on. Note what you needed in your summary.")
             return
         rest = strip_away_cli(cmd)
         if SELF_PATHS.search(rest) and MUTATES.search(rest):

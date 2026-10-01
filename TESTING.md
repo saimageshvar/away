@@ -108,6 +108,7 @@ Away ON:
 | `away on`, `away off` | deny. Only the operator toggles the global flag |
 | `away on --here`, `away off --here` | allow. A session may scope itself |
 | `away off --here && away off` | deny. Scope is judged per command segment |
+| `away purge`, `setup`, `update`, `uninstall`, `uninstall.sh` | deny. The operator's while away |
 | `Edit`/`Write` on `~/.claude/away/**` or `settings.json` | deny |
 | `away report`, `status`, `perms`, `trash`, `decision` | allow |
 

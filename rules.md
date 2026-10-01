@@ -6,7 +6,9 @@ These rules apply in every repo and to every subagent.
 It is on either globally, for every session, or for this session alone. The rules below are
 identical either way. You may scope away mode to your own session with `away on --here`, and
 drop your own scope with `away off --here`. You may never switch the global flag in either
-direction: that belongs to the operator, from their own terminal.
+direction, nor run `away purge`, `setup`, `update` or `uninstall`: those belong to the
+operator, from their own terminal. `away decision`, `perms`, `report`, `status` and `trash`
+are yours.
 
 If `away` is not on your PATH, call it at `~/.claude/away/bin/away`. Never skip a step
 because the command was not found.
